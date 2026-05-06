@@ -5,6 +5,7 @@ Generates market open/close reports as PDF and sends summaries to Telegram.
 from datetime import datetime
 from pathlib import Path
 
+import yfinance as yf
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -14,6 +15,27 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 import config
 from ig_client import IGClient
 from utils import send_telegram, send_telegram_document, log
+
+INDICES = {
+    "S&P 500":      "^GSPC",
+    "NASDAQ":       "^IXIC",
+    "Dow Jones":    "^DJI",
+    "Russell 2000": "^RUT",
+    "VIX":          "^VIX",
+}
+
+SECTORS = {
+    "Technology":    "XLK",
+    "Financials":    "XLF",
+    "Energy":        "XLE",
+    "Healthcare":    "XLV",
+    "Industrials":   "XLI",
+    "Consumer Disc": "XLY",
+    "Consumer Stap": "XLP",
+    "Utilities":     "XLU",
+    "Real Estate":   "XLRE",
+    "Materials":     "XLB",
+}
 
 REPORT_DIR = Path("reports")
 REPORT_DIR.mkdir(exist_ok=True)
@@ -26,7 +48,8 @@ def gather_account_snapshot(client: IGClient) -> dict:
     pnl          = float(acc["balance"]["profitLoss"])
     currency     = acc["currency"]
     positions    = client.get_positions()
-    transactions = client.get_transactions(max_span_seconds=86400)
+    transactions = [t for t in client.get_transactions(max_span_seconds=86400)
+                    if t.get("epic") == config.IG_EPIC]
 
     return {
         "equity":       balance,
@@ -39,7 +62,29 @@ def gather_account_snapshot(client: IGClient) -> dict:
     }
 
 
-def build_report_pdf(snapshot: dict, report_type: str, output_path: Path) -> None:
+def gather_market_data() -> dict:
+    """Fetch latest index prices and sector performance from Yahoo Finance."""
+    def _fetch(ticker: str) -> dict | None:
+        try:
+            hist = yf.Ticker(ticker).history(period="2d", interval="1d", prepost=True)
+            if len(hist) < 2:
+                return None
+            prev  = float(hist["Close"].iloc[-2])
+            last  = float(hist["Close"].iloc[-1])
+            pct   = (last - prev) / prev * 100
+            return {"price": last, "prev": prev, "pct": pct}
+        except Exception:
+            return None
+
+    indices = {name: _fetch(sym) for name, sym in INDICES.items()}
+    sectors = {name: _fetch(sym) for name, sym in SECTORS.items()}
+    return {
+        "indices": {k: v for k, v in indices.items() if v},
+        "sectors": {k: v for k, v in sectors.items() if v},
+    }
+
+
+def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market: dict | None = None) -> None:
     doc = SimpleDocTemplate(
         str(output_path), pagesize=letter,
         rightMargin=0.75 * inch, leftMargin=0.75 * inch,
@@ -101,6 +146,57 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path) -> Non
         ("GRID",          (0, 0), (-1, -1), 0.5, colors.lightgrey),
     ]))
     story.append(summary_table)
+
+    # Market overview
+    if market:
+        def _arrow(pct): return "▲" if pct >= 0 else "▼"
+        def _color(pct): return colors.HexColor("#276749") if pct >= 0 else colors.HexColor("#c53030")
+
+        if market.get("indices"):
+            story.append(Paragraph("Market Overview", section_style))
+            idx_data = [["Index", "Price", "Change"]]
+            for name, d in market["indices"].items():
+                idx_data.append([name, f"{d['price']:,.2f}", f"{_arrow(d['pct'])} {d['pct']:+.2f}%"])
+            idx_table = Table(idx_data, colWidths=[2.2 * inch, 2 * inch, 2 * inch])
+            idx_style = [
+                ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 11),
+                ("ALIGN",         (1, 0), (-1, -1), "RIGHT"),
+                ("GRID",          (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING",    (0, 0), (-1, -1), 7),
+            ]
+            for i, (_, d) in enumerate(market["indices"].items(), start=1):
+                idx_style.append(("TEXTCOLOR", (2, i), (2, i), _color(d["pct"])))
+                idx_style.append(("FONTNAME",  (2, i), (2, i), "Helvetica-Bold"))
+            idx_table.setStyle(TableStyle(idx_style))
+            story.append(idx_table)
+
+        if market.get("sectors"):
+            story.append(Paragraph("Sector Performance", section_style))
+            sec_data = [["Sector", "Price", "Change"]]
+            for name, d in market["sectors"].items():
+                sec_data.append([name, f"{d['price']:.2f}", f"{_arrow(d['pct'])} {d['pct']:+.2f}%"])
+            sec_table = Table(sec_data, colWidths=[2.2 * inch, 2 * inch, 2 * inch])
+            sec_style = [
+                ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 10),
+                ("ALIGN",         (1, 0), (-1, -1), "RIGHT"),
+                ("GRID",          (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ]
+            for i, (_, d) in enumerate(market["sectors"].items(), start=1):
+                sec_style.append(("TEXTCOLOR", (2, i), (2, i), _color(d["pct"])))
+                sec_style.append(("FONTNAME",  (2, i), (2, i), "Helvetica-Bold"))
+            sec_table.setStyle(TableStyle(sec_style))
+            story.append(sec_table)
 
     # Open positions
     story.append(Paragraph("Open Positions", section_style))
@@ -186,7 +282,7 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path) -> Non
     doc.build(story)
 
 
-def build_telegram_summary(snapshot: dict, report_type: str) -> str:
+def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None = None) -> str:
     equity = snapshot["equity"]
     cash   = snapshot["cash"]
     pnl    = snapshot["pnl"]
@@ -198,6 +294,21 @@ def build_telegram_summary(snapshot: dict, report_type: str) -> str:
     ts    = snapshot["timestamp"].strftime("%Y-%m-%d %H:%M")
 
     msg  = f"{title}\n<i>{ts}</i>\n\n"
+
+    if market:
+        def _e(pct): return "🟢" if pct >= 0 else "🔴"
+        if market.get("indices"):
+            msg += "📈 <b>Market Overview</b>\n"
+            for name, d in market["indices"].items():
+                msg += f"  {_e(d['pct'])} <b>{name}:</b> {d['price']:,.2f}  ({d['pct']:+.2f}%)\n"
+            msg += "\n"
+        if market.get("sectors"):
+            sorted_sec = sorted(market["sectors"].items(), key=lambda x: x[1]["pct"], reverse=True)
+            msg += "🏭 <b>Sectors</b>\n"
+            for name, d in sorted_sec:
+                msg += f"  {_e(d['pct'])} {name}: {d['pct']:+.2f}%\n"
+            msg += "\n"
+
     msg += f"💰 <b>Balance:</b> {cur} {equity:,.2f}\n"
     msg += f"💵 <b>Available:</b> {cur} {cash:,.2f}\n"
     msg += f"{emoji} <b>P/L:</b> {sign}{cur} {pnl:,.2f}\n\n"
@@ -234,13 +345,19 @@ def generate_report(report_type: str = "close", client: IGClient = None) -> Path
         client.login()
 
     snapshot = gather_account_snapshot(client)
+
+    market = None
+    if report_type == "open":
+        log.info("Fetching market data from Yahoo Finance...")
+        market = gather_market_data()
+
     date_str = snapshot["timestamp"].strftime("%Y-%m-%d")
     pdf_path = REPORT_DIR / f"{date_str}_{report_type}_report.pdf"
 
-    build_report_pdf(snapshot, report_type, pdf_path)
+    build_report_pdf(snapshot, report_type, pdf_path, market=market)
     log.info(f"PDF saved: {pdf_path}")
 
-    send_telegram(build_telegram_summary(snapshot, report_type))
+    send_telegram(build_telegram_summary(snapshot, report_type, market=market))
     send_telegram_document(pdf_path, caption=f"📄 {report_type.title()} report")
 
     return pdf_path
