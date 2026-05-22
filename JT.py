@@ -393,19 +393,87 @@ def scan_all_markets(ig: IGClient, mapping):
             logging.error(f"Error scanning {epic}: {e}")
     return signals
 
+# ================== ACCOUNT REPORT ==================
+def send_account_report(ig: IGClient):
+    try:
+        r = ig._request("GET", f"{ig.base}/accounts")
+        accounts = r.json().get("accounts", [])
+        acc = next((a for a in accounts if a.get("preferred")), accounts[0] if accounts else {})
+        balance    = acc.get("balance", {}).get("balance", "N/A")
+        deposit    = acc.get("balance", {}).get("deposit", "N/A")
+        pnl        = acc.get("balance", {}).get("profitLoss", "N/A")
+        available  = acc.get("balance", {}).get("available", "N/A")
+        currency   = acc.get("currency", "")
+    except Exception as e:
+        tg_send(f"⚠️ Could not fetch account info: {e}")
+        return
+
+    try:
+        r2 = ig._request("GET", f"{ig.base}/positions")
+        positions = r2.json().get("positions", [])
+        pos_lines = []
+        for p in positions:
+            pos = p.get("position", {})
+            mkt = p.get("market", {})
+            pos_lines.append(
+                f"  {mkt.get('instrumentName','?')} | {pos.get('direction','?')} "
+                f"x{pos.get('size','?')} | P&L: {pos.get('upl','?')}"
+            )
+        pos_text = "\n".join(pos_lines) if pos_lines else "  No open positions"
+    except Exception:
+        pos_text = "  Could not fetch positions"
+
+    msg = (
+        f"📊 Account Report\n"
+        f"Balance:   {balance} {currency}\n"
+        f"Available: {available} {currency}\n"
+        f"Deposit:   {deposit} {currency}\n"
+        f"P&L:       {pnl} {currency}\n"
+        f"\nOpen Positions:\n{pos_text}"
+    )
+    tg_send(msg)
+    logging.info("Account report sent")
+
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
 def live_trading_all_us_stocks():
     ig = IGClient(IG_API_KEY, IG_IDENTIFIER, IG_PASSWORD, IG_ACCOUNT_ID, demo=IG_DEMO)
-    tg_send("🤖 IG Bot Started (S&P500 + NASDAQ100)")
+    tg_send("🤖 IG Bot Started (Top 30 US Stocks)")
 
     mapping = build_epic_universe(ig)  # list of (ticker, epic)
     tg_send(f"Tracking {len(mapping)} EPICs")
+    send_account_report(ig)
 
     # epic -> (deal_id, entry_price, tp, sl, type, ticker)
     open_positions = {}
+    last_report_time = time.time()
+    sent_premarket_date  = None
+    sent_postmarket_date = None
 
     while True:
         try:
+            from datetime import datetime, timezone
+            now_utc = datetime.now(timezone.utc)
+            today   = now_utc.date()
+
+            # Pre-market report: 9:15 AM ET = 13:15 UTC
+            if (now_utc.hour, now_utc.minute) >= (13, 15) and sent_premarket_date != today:
+                send_account_report(ig)
+                tg_send("🔔 Pre-Market Report (US market opens at 9:30 AM ET)")
+                sent_premarket_date = today
+                last_report_time = time.time()
+
+            # Post-market report: 4:15 PM ET = 20:15 UTC
+            if (now_utc.hour, now_utc.minute) >= (20, 15) and sent_postmarket_date != today:
+                send_account_report(ig)
+                tg_send("🔔 Post-Market Report (US market closed at 4:00 PM ET)")
+                sent_postmarket_date = today
+                last_report_time = time.time()
+
+            # Hourly report (only if pre/post market didn't already fire)
+            if time.time() - last_report_time >= 3600:
+                send_account_report(ig)
+                last_report_time = time.time()
+
             signals = scan_all_markets(ig, mapping)
 
             # Entries
