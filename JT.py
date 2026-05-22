@@ -3,6 +3,7 @@ import os
 import json
 import time
 import logging
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -49,6 +50,95 @@ def tg_send(msg: str):
 
 def tg_report(summary: str):
     tg_send("📊 REPORT\n" + summary)
+
+MENU = (
+    "📋 Menu — reply with a number:\n"
+    "1 - Account report\n"
+    "2 - Open positions\n"
+    "3 - Trading stats\n"
+    "4 - Bot status\n"
+    "0 - Show this menu"
+)
+
+# Shared state for Telegram listener
+_bot_state = {
+    "ig": None,
+    "open_positions": {},
+    "trade_log": [],       # list of pnl values
+    "start_time": time.time(),
+    "last_scan": None,
+}
+
+def tg_handle_command(text: str):
+    cmd = text.strip()
+    ig  = _bot_state.get("ig")
+
+    if cmd == "0":
+        tg_send(MENU)
+
+    elif cmd == "1":
+        if ig:
+            send_account_report(ig)
+        else:
+            tg_send("⚠️ Bot not connected yet.")
+
+    elif cmd == "2":
+        pos = _bot_state.get("open_positions", {})
+        if not pos:
+            tg_send("No open positions.")
+        else:
+            lines = ["📂 Open Positions:"]
+            for epic, (deal_id, entry, tp, sl, sig, ticker) in pos.items():
+                lines.append(f"  {ticker} ({sig})\n  Entry:{entry:.2f} TP:{tp:.2f} SL:{sl:.2f}")
+            tg_send("\n".join(lines))
+
+    elif cmd == "3":
+        trades = _bot_state.get("trade_log", [])
+        if not trades:
+            tg_send("No trades yet.")
+        else:
+            wins   = sum(1 for t in trades if t > 0)
+            losses = sum(1 for t in trades if t <= 0)
+            total_pnl = sum(trades)
+            tg_send(
+                f"📈 Trading Stats\n"
+                f"Trades: {len(trades)}\n"
+                f"Wins:   {wins} | Losses: {losses}\n"
+                f"Total P&L: {total_pnl:.2f}"
+            )
+
+    elif cmd == "4":
+        uptime = int(time.time() - _bot_state.get("start_time", time.time()))
+        h, m = divmod(uptime // 60, 60)
+        last = _bot_state.get("last_scan")
+        last_str = last if last else "not yet"
+        tg_send(
+            f"🤖 Bot Status\n"
+            f"Uptime: {h}h {m}m\n"
+            f"Last scan: {last_str}\n"
+            f"Open positions: {len(_bot_state.get('open_positions', {}))}"
+        )
+    else:
+        tg_send(MENU)
+
+def tg_listener():
+    if not TELEGRAM_TOKEN:
+        return
+    offset = 0
+    url_updates = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    while True:
+        try:
+            r = requests.get(url_updates, params={"offset": offset, "timeout": 30}, timeout=35)
+            for update in r.json().get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "")
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    tg_handle_command(text)
+        except Exception as e:
+            logging.error(f"Telegram listener error: {e}")
+            time.sleep(5)
 
 # ================== IG CLIENT ==================
 class IGClient:
@@ -437,7 +527,13 @@ def send_account_report(ig: IGClient):
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
 def live_trading_all_us_stocks():
     ig = IGClient(IG_API_KEY, IG_IDENTIFIER, IG_PASSWORD, IG_ACCOUNT_ID, demo=IG_DEMO)
+    _bot_state["ig"] = ig
+    _bot_state["start_time"] = time.time()
+
+    threading.Thread(target=tg_listener, daemon=True).start()
+
     tg_send("🤖 IG Bot Started (Top 30 US Stocks)")
+    tg_send(MENU)
 
     mapping = build_epic_universe(ig)  # list of (ticker, epic)
     tg_send(f"Tracking {len(mapping)} EPICs")
@@ -445,6 +541,7 @@ def live_trading_all_us_stocks():
 
     # epic -> (deal_id, entry_price, tp, sl, type, ticker)
     open_positions = {}
+    _bot_state["open_positions"] = open_positions
     last_report_time = time.time()
     sent_premarket_date  = None
     sent_postmarket_date = None
@@ -475,6 +572,7 @@ def live_trading_all_us_stocks():
                 last_report_time = time.time()
 
             signals = scan_all_markets(ig, mapping)
+            _bot_state["last_scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
             # Entries
             for epic, ticker, sig_type, price, tp, sl in signals:
@@ -494,7 +592,6 @@ def live_trading_all_us_stocks():
 
                 last_price = get_realtime_price(ticker)
                 if last_price is None:
-                    # fallback to IG last close
                     data = ig.prices(epic, "H1", 2)
                     df = ig_prices_to_df(data)
                     if df.empty:
@@ -504,6 +601,7 @@ def live_trading_all_us_stocks():
                 if last_price >= tp:
                     ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
                     pnl = tp - entry_price
+                    _bot_state["trade_log"].append(pnl)
                     msg = f"✅ TP {epic} ({ticker}) {sig_type} PnL={pnl:.2f}"
                     tg_send(msg)
                     logging.info(msg)
@@ -512,6 +610,7 @@ def live_trading_all_us_stocks():
                 elif last_price <= sl:
                     ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
                     pnl = sl - entry_price
+                    _bot_state["trade_log"].append(pnl)
                     msg = f"❌ SL {epic} ({ticker}) {sig_type} PnL={pnl:.2f}"
                     tg_send(msg)
                     logging.info(msg)
