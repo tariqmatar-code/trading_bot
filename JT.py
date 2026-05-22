@@ -85,6 +85,12 @@ class IGClient:
     def _request(self, method, url, **kwargs):
         r = self.session.request(method, url, **kwargs)
         if r.status_code == 403:
+            try:
+                err = r.json().get("errorCode", "")
+            except Exception:
+                err = ""
+            if "allowance" in err:
+                r.raise_for_status()
             logging.info("IG session expired — re-authenticating")
             self.auth()
             r = self.session.request(method, url, **kwargs)
@@ -152,32 +158,15 @@ def get_epic(ig: IGClient, ticker: str):
         return None
 
 # ================== TICKER UNIVERSE ==================
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"}
-
-def load_sp500_tickers():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    html = requests.get(url, headers=_HEADERS, timeout=15).text
-    tables = pd.read_html(io.StringIO(html))
-    df = tables[0]
-    tickers = df['Symbol'].tolist()
-    tickers = [t.replace('.', '-') for t in tickers]
-    return tickers
-
-def load_nasdaq100_tickers():
-    url = "https://en.wikipedia.org/wiki/NASDAQ-100"
-    html = requests.get(url, headers=_HEADERS, timeout=15).text
-    tables = pd.read_html(io.StringIO(html))
-    df = next(t for t in tables if 'Ticker' in t.columns)
-    col = 'Ticker'
-    tickers = df[col].dropna().tolist()
-    tickers = [t.replace('.', '-') for t in tickers]
-    return tickers
+US_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B",
+    "JPM", "V", "UNH", "XOM", "LLY", "JNJ", "WMT", "MA", "PG", "AVGO",
+    "HD", "CVX", "MRK", "ABBV", "COST", "PEP", "KO", "ADBE", "NFLX",
+    "CRM", "AMD", "INTC"
+]
 
 def load_us_stock_universe():
-    sp = load_sp500_tickers()
-    ndx = load_nasdaq100_tickers()
-    universe = sorted(set(sp + ndx))
-    return universe
+    return US_UNIVERSE
 
 EPIC_CACHE_FILE = "epic_cache.json"
 
@@ -197,7 +186,7 @@ def build_epic_universe(ig: IGClient):
             mapping.append((t, epic))
         if i % 50 == 0:
             logging.info(f"EPIC lookup progress: {i}/{len(tickers)}")
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     with open(EPIC_CACHE_FILE, "w") as f:
         json.dump(mapping, f)
