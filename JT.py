@@ -70,7 +70,8 @@ MENU = (
     "8 - Start bot\n"
     "9 - Top losers + most active (Claude AI)\n"
     "0 - Show this menu\n"
-    "\n💡 Quick trade: type  BUY TSLA 1  or  SELL MSFT 2  anytime"
+    "\n💡 Quick: type  buy  or  sell  to start guided order\n"
+    "   Or direct: BUY AAPL 1 / SELL TSLA 2"
 )
 
 # Shared state for Telegram listener
@@ -84,6 +85,7 @@ _bot_state = {
     "awaiting_order": False,
     "awaiting_confirm": None,   # pending order dict waiting for y/n
     "awaiting_close": None,     # list of open positions waiting for number
+    "awaiting_trade": None,     # guided buy/sell: {step, direction, ticker, size}
 }
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
@@ -149,6 +151,50 @@ def tg_handle_command(text: str):
         except Exception as e:
             tg_send(f"❌ Close failed: {e}")
         return
+
+    # ── Guided trade flow (multi-step) ────────────────────
+    if _bot_state.get("awaiting_trade") is not None:
+        trade = _bot_state["awaiting_trade"]
+        if cmd.lower() in ("n", "no", "cancel"):
+            _bot_state["awaiting_trade"] = None
+            tg_send("❌ Order cancelled.")
+            return
+        if trade["step"] == "ticker":
+            trade["ticker"] = cmd.upper()
+            trade["step"]   = "size"
+            _bot_state["awaiting_trade"] = trade
+            tg_send(f"How many shares of {trade['ticker']}?\n(type a number, e.g. 1)")
+            return
+        if trade["step"] == "size":
+            try:
+                trade["size"] = float(cmd.replace(",", "."))
+            except ValueError:
+                tg_send("Invalid number. How many shares? (e.g. 1)")
+                return
+            trade["step"] = "confirm"
+            _bot_state["awaiting_trade"] = trade
+            price = get_realtime_price(trade["ticker"])
+            price_str = f"@ ${price:.2f}" if price else ""
+            tg_send(
+                f"⚠️ Confirm order:\n"
+                f"{trade['direction']} {trade['ticker']} x{trade['size']} {price_str}\n"
+                f"Reply y to confirm or n to cancel"
+            )
+            return
+        if trade["step"] == "confirm":
+            _bot_state["awaiting_trade"] = None
+            if cmd.lower() in ("y", "yes"):
+                if not ig:
+                    tg_send("⚠️ Bot not connected.")
+                    return
+                threading.Thread(
+                    target=_execute_order,
+                    args=(ig, trade["direction"], trade["ticker"], trade["size"]),
+                    daemon=True
+                ).start()
+            else:
+                tg_send("❌ Order cancelled.")
+            return
 
     # ── Direct trade: BUY TSLA / BUY TSLA 2 / SELL MSFT ──
     parts = cmd.upper().split()
@@ -217,16 +263,11 @@ def tg_handle_command(text: str):
             f"Open positions: {len(_bot_state.get('open_positions', {}))}"
         )
 
-    elif cmd == "5":
-        tg_send(
-            "📈 BUY a stock\n"
-            "Type: BUY <TICKER> <SIZE>\n"
-            "Example: BUY TSLA 1\n"
-            "         BUY AAPL 2\n\n"
-            "Or just: BUY TSLA  (uses default size)"
-        )
+    elif cmd in ("5", "BUY", "buy"):
+        _bot_state["awaiting_trade"] = {"step": "ticker", "direction": "BUY", "ticker": None, "size": None}
+        tg_send("📈 BUY — Which stock?\nType the ticker symbol (e.g. AAPL, TSLA, NVDA, MSFT)\nor n to cancel")
 
-    elif cmd == "6":
+    elif cmd in ("6", "SELL", "sell"):
         pos = _bot_state.get("open_positions", {})
         if not pos:
             tg_send("No open positions to close.")
