@@ -89,15 +89,20 @@ _bot_state = {
 }
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
-    """Place an order and send Telegram confirmation."""
+    """Place an order and send Telegram confirmation with fill price."""
     try:
         epic = get_epic(ig, ticker)
         if not epic:
             tg_send(f"⚠️ Could not find EPIC for {ticker}.")
             return
+        buy_price = get_realtime_price(ticker)
         res = ig.place_order(epic, direction, size)
         ref = res.get("dealReference", "N/A")
-        tg_send(f"✅ {direction} {ticker} x{size} placed\nRef: {ref}")
+        price_str = f"@ ${buy_price:.2f}" if buy_price else ""
+        tg_send(
+            f"✅ {direction} {ticker} x{size} placed {price_str}\n"
+            f"Ref: {ref}"
+        )
     except Exception as e:
         tg_send(f"❌ Order failed: {e}")
 
@@ -142,12 +147,17 @@ def tg_handle_command(text: str):
             tg_send("⚠️ Bot not connected.")
             return
         try:
+            sell_price = get_realtime_price(ticker) or sl
             ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
-            last_price = get_realtime_price(ticker) or sl
-            pnl = last_price - entry
+            pnl = sell_price - entry
             _bot_state["trade_log"].append(pnl)
             _bot_state["open_positions"].pop(epic, None)
-            tg_send(f"✅ Closed {ticker} ({sig})\nEntry: {entry:.2f} → Exit: {last_price:.2f}\nP&L: {pnl:+.2f}")
+            tg_send(
+                f"✅ Closed {ticker} ({sig})\n"
+                f"Buy:  ${entry:.2f}\n"
+                f"Sell: ${sell_price:.2f}\n"
+                f"P&L:  {pnl:+.2f}"
+            )
         except Exception as e:
             tg_send(f"❌ Close failed: {e}")
         return
@@ -233,7 +243,14 @@ def tg_handle_command(text: str):
         else:
             lines = ["📂 Open Positions:"]
             for epic, (deal_id, entry, tp, sl, sig, ticker) in pos.items():
-                lines.append(f"  {ticker} ({sig})\n  Entry:{entry:.2f} TP:{tp:.2f} SL:{sl:.2f}")
+                current = get_realtime_price(ticker)
+                pnl_str = f"  P&L: {current - entry:+.2f}" if current else ""
+                price_str = f"  Now: ${current:.2f}" if current else ""
+                lines.append(
+                    f"  {ticker} ({sig})\n"
+                    f"  Buy: ${entry:.2f}{price_str}{pnl_str}\n"
+                    f"  TP: ${tp:.2f}  SL: ${sl:.2f}"
+                )
             tg_send("\n".join(lines))
 
     elif cmd == "3":
@@ -275,9 +292,12 @@ def tg_handle_command(text: str):
         lines = ["📂 Select position to close (reply with number):"]
         pos_list = list(pos.items())
         for i, (epic, (deal_id, entry, tp, sl, sig, ticker)) in enumerate(pos_list, 1):
-            last_price = get_realtime_price(ticker)
-            pnl_str = f"  P&L: {last_price - entry:+.2f}" if last_price else ""
-            lines.append(f"  {i}. {ticker} ({sig}) Entry:{entry:.2f}{pnl_str}")
+            current = get_realtime_price(ticker)
+            if current:
+                pnl = current - entry
+                lines.append(f"  {i}. {ticker}  Buy: ${entry:.2f} → Now: ${current:.2f}  P&L: {pnl:+.2f}")
+            else:
+                lines.append(f"  {i}. {ticker}  Buy: ${entry:.2f}")
         lines.append("\nReply n to cancel")
         _bot_state["awaiting_close"] = pos_list
         tg_send("\n".join(lines))
