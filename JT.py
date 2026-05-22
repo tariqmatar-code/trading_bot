@@ -67,7 +67,7 @@ MENU = (
     "5 - Place order\n"
     "6 - Stop bot\n"
     "7 - Start bot\n"
-    "8 - Top losers + Claude entry analysis\n"
+    "8 - Top losers + most active (Claude AI)\n"
     "0 - Show this menu"
 )
 
@@ -581,26 +581,71 @@ def send_account_report(ig: IGClient):
     logging.info("Account report sent")
 
 # ================== CLAUDE TOP-LOSERS ANALYSIS ==================
+_YF_SCREENER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
+_YF_SCREENER_URL = (
+    "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    "?formatted=false&lang=en-US&region=US&count={count}&scrIds={scr_id}"
+)
+
+
+def _yf_screener(scr_id: str, n: int = 5):
+    """Fetch a Yahoo Finance predefined screener. Returns list of quote dicts."""
+    try:
+        url = _YF_SCREENER_URL.format(count=max(n * 2, 20), scr_id=scr_id)
+        r = requests.get(url, headers=_YF_SCREENER_HEADERS, timeout=10)
+        r.raise_for_status()
+        quotes = r.json()["finance"]["result"][0]["quotes"]
+        return quotes[:n]
+    except Exception as e:
+        logging.error(f"YF screener {scr_id} error: {e}")
+        return []
+
+
 def _get_top_losers(n=5):
-    """Return list of (ticker, pct_change, current_price) for the biggest losers today."""
+    """Top losers today from Yahoo Finance day_losers screener."""
+    quotes = _yf_screener("day_losers", n)
     results = []
-    raw = yf.download(US_UNIVERSE, period="2d", interval="1d", progress=False, group_by="ticker")
-    for ticker in US_UNIVERSE:
-        try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                closes = raw[ticker]["Close"].dropna()
-            else:
-                closes = raw["Close"].dropna()
-            if len(closes) < 2:
+    for q in quotes:
+        ticker = q.get("symbol", "")
+        pct    = float(q.get("regularMarketChangePercent", 0))
+        price  = float(q.get("regularMarketPrice", 0))
+        results.append((ticker, pct, price))
+    # fallback: compute from US_UNIVERSE if screener returned nothing
+    if not results:
+        raw = yf.download(US_UNIVERSE, period="2d", interval="1d", progress=False, group_by="ticker")
+        for ticker in US_UNIVERSE:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    closes = raw[ticker]["Close"].dropna()
+                else:
+                    closes = raw["Close"].dropna()
+                if len(closes) < 2:
+                    continue
+                prev_close  = float(closes.iloc[-2])
+                today_close = float(closes.iloc[-1])
+                pct = (today_close - prev_close) / prev_close * 100
+                results.append((ticker, pct, today_close))
+            except Exception:
                 continue
-            prev_close = float(closes.iloc[-2])
-            today_close = float(closes.iloc[-1])
-            pct = (today_close - prev_close) / prev_close * 100
-            results.append((ticker, pct, today_close))
-        except Exception:
-            continue
-    results.sort(key=lambda x: x[1])
-    return results[:n]
+        results.sort(key=lambda x: x[1])
+        results = results[:n]
+    return results
+
+
+def _get_most_active(n=5):
+    """Most active stocks today from Yahoo Finance most_actives screener."""
+    quotes = _yf_screener("most_actives", n)
+    results = []
+    for q in quotes:
+        ticker = q.get("symbol", "")
+        pct    = float(q.get("regularMarketChangePercent", 0))
+        price  = float(q.get("regularMarketPrice", 0))
+        volume = int(q.get("regularMarketVolume", 0))
+        results.append((ticker, pct, price, volume))
+    return results
 
 
 def _ichimoku_summary(ticker: str):
@@ -645,7 +690,7 @@ def _ichimoku_summary(ticker: str):
 
 
 def analyze_top_losers():
-    """Fetch top 5 losers, run Ichimoku on each, ask Claude for entry recommendations."""
+    """Fetch top losers + most active, run Ichimoku on each, ask Claude for entry recommendations."""
     if not _ANTHROPIC_OK:
         tg_send("⚠️ anthropic package not installed. Run: pip install anthropic")
         return
@@ -653,43 +698,84 @@ def analyze_top_losers():
         tg_send("⚠️ CLAUDE_API_KEY not set in .env")
         return
 
-    tg_send("🔍 Fetching today's top losers from US_UNIVERSE...")
+    tg_send("🔍 Fetching today's top losers & most active from Yahoo Finance...")
+
+    # ── Top losers ──────────────────────────────────────────
     try:
         losers = _get_top_losers(5)
     except Exception as e:
         tg_send(f"⚠️ Failed to fetch top losers: {e}")
+        losers = []
+
+    # ── Most active ─────────────────────────────────────────
+    try:
+        actives = _get_most_active(5)
+    except Exception as e:
+        tg_send(f"⚠️ Failed to fetch most active: {e}")
+        actives = []
+
+    if not losers and not actives:
+        tg_send("No market data available today.")
         return
 
-    if not losers:
-        tg_send("No loser data available today.")
-        return
+    # ── Send raw lists to Telegram ───────────────────────────
+    if losers:
+        lines = ["📉 Top 5 Losers today:"]
+        for ticker, pct, price in losers:
+            lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
+        tg_send("\n".join(lines))
 
-    lines = ["📉 Top 5 Losers today:"]
-    analysis_data = []
-    for ticker, pct, price in losers:
-        summary = _ichimoku_summary(ticker)
-        lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
-        analysis_data.append(f"- {ticker}: {pct:+.2f}% change, price ${price:.2f}\n  Ichimoku: {summary}")
+    if actives:
+        lines = ["🔥 Top 5 Most Active today:"]
+        for ticker, pct, price, vol in actives:
+            vol_str = f"{vol/1_000_000:.1f}M" if vol >= 1_000_000 else f"{vol/1_000:.0f}K"
+            lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}  Vol {vol_str}")
+        tg_send("\n".join(lines))
 
-    tg_send("\n".join(lines))
-    tg_send("🤖 Asking Claude for entry analysis...")
+    tg_send("🤖 Running Ichimoku analysis & asking Claude...")
+
+    # ── Build analysis data for Claude ──────────────────────
+    analysis_sections = []
+
+    if losers:
+        loser_lines = []
+        for ticker, pct, price in losers:
+            summary = _ichimoku_summary(ticker)
+            loser_lines.append(
+                f"- {ticker}: {pct:+.2f}% change, price ${price:.2f}\n  Ichimoku: {summary}"
+            )
+        analysis_sections.append(
+            "TOP LOSERS:\n" + "\n".join(loser_lines)
+        )
+
+    if actives:
+        active_lines = []
+        for ticker, pct, price, vol in actives:
+            summary = _ichimoku_summary(ticker)
+            vol_str = f"{vol/1_000_000:.1f}M" if vol >= 1_000_000 else f"{vol/1_000:.0f}K"
+            active_lines.append(
+                f"- {ticker}: {pct:+.2f}% change, price ${price:.2f}, volume {vol_str}\n  Ichimoku: {summary}"
+            )
+        analysis_sections.append(
+            "MOST ACTIVE:\n" + "\n".join(active_lines)
+        )
 
     prompt = (
         "You are an expert technical analyst using the Ichimoku + Fibonacci strategy.\n\n"
-        "Today's top losers from the US_UNIVERSE watchlist with their Ichimoku analysis:\n\n"
-        + "\n".join(analysis_data)
-        + "\n\nFor each ticker:\n"
-        "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fibonacci)\n"
-        "2. If yes, what is the entry price zone, take-profit, and stop-loss?\n"
-        "3. Rank the top 2 best entries by risk/reward.\n\n"
-        "Be concise. Format the response for a Telegram message (max 4000 chars)."
+        "Here is today's market data with Ichimoku analysis:\n\n"
+        + "\n\n".join(analysis_sections)
+        + "\n\nFor each ticker in BOTH lists:\n"
+        "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fib)\n"
+        "2. If yes, give entry zone, take-profit, and stop-loss levels.\n"
+        "3. At the end, rank the TOP 3 best trade opportunities across both lists by risk/reward.\n\n"
+        "Be concise. Format for Telegram (max 4000 chars)."
     )
 
     try:
         client = _anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         with client.messages.stream(
             model="claude-opus-4-7",
-            max_tokens=1500,
+            max_tokens=1800,
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
