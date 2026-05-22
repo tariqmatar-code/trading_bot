@@ -57,6 +57,9 @@ MENU = (
     "2 - Open positions\n"
     "3 - Trading stats\n"
     "4 - Bot status\n"
+    "5 - Place order\n"
+    "6 - Stop bot\n"
+    "7 - Start bot\n"
     "0 - Show this menu"
 )
 
@@ -64,14 +67,43 @@ MENU = (
 _bot_state = {
     "ig": None,
     "open_positions": {},
-    "trade_log": [],       # list of pnl values
+    "trade_log": [],
     "start_time": time.time(),
     "last_scan": None,
+    "running": True,
+    "awaiting_order": False,
 }
 
 def tg_handle_command(text: str):
     cmd = text.strip()
     ig  = _bot_state.get("ig")
+
+    # Handle pending order input: "BUY TSLA 1" or "SELL MSFT 2"
+    if _bot_state.get("awaiting_order"):
+        _bot_state["awaiting_order"] = False
+        parts = cmd.upper().split()
+        if len(parts) == 3 and parts[0] in ("BUY", "SELL"):
+            direction, ticker, size = parts[0], parts[1], parts[2]
+            try:
+                size = float(size)
+            except ValueError:
+                tg_send("Invalid size. Order cancelled.")
+                return
+            if not ig:
+                tg_send("⚠️ Bot not connected.")
+                return
+            try:
+                epic = get_epic(ig, ticker)
+                if not epic:
+                    tg_send(f"Could not find EPIC for {ticker}.")
+                    return
+                res = ig.place_order(epic, direction, size)
+                tg_send(f"✅ Order placed: {direction} {ticker} x{size}\nRef: {res.get('dealReference','N/A')}")
+            except Exception as e:
+                tg_send(f"❌ Order failed: {e}")
+        else:
+            tg_send("Format: BUY TSLA 1 or SELL MSFT 2\nOrder cancelled.")
+        return
 
     if cmd == "0":
         tg_send(MENU)
@@ -97,8 +129,8 @@ def tg_handle_command(text: str):
         if not trades:
             tg_send("No trades yet.")
         else:
-            wins   = sum(1 for t in trades if t > 0)
-            losses = sum(1 for t in trades if t <= 0)
+            wins      = sum(1 for t in trades if t > 0)
+            losses    = sum(1 for t in trades if t <= 0)
             total_pnl = sum(trades)
             tg_send(
                 f"📈 Trading Stats\n"
@@ -109,15 +141,28 @@ def tg_handle_command(text: str):
 
     elif cmd == "4":
         uptime = int(time.time() - _bot_state.get("start_time", time.time()))
-        h, m = divmod(uptime // 60, 60)
-        last = _bot_state.get("last_scan")
-        last_str = last if last else "not yet"
+        h, m   = divmod(uptime // 60, 60)
+        last   = _bot_state.get("last_scan") or "not yet"
+        status = "▶️ Running" if _bot_state.get("running") else "⏸ Paused"
         tg_send(
-            f"🤖 Bot Status\n"
+            f"🤖 Bot Status: {status}\n"
             f"Uptime: {h}h {m}m\n"
-            f"Last scan: {last_str}\n"
+            f"Last scan: {last}\n"
             f"Open positions: {len(_bot_state.get('open_positions', {}))}"
         )
+
+    elif cmd == "5":
+        tg_send("Send order in format:\nBUY TSLA 1\nor\nSELL MSFT 2")
+        _bot_state["awaiting_order"] = True
+
+    elif cmd == "6":
+        _bot_state["running"] = False
+        tg_send("⏸ Bot paused. Auto-scanning stopped.\nSend 7 to resume.")
+
+    elif cmd == "7":
+        _bot_state["running"] = True
+        tg_send("▶️ Bot resumed. Auto-scanning active.")
+
     else:
         tg_send(MENU)
 
@@ -570,6 +615,10 @@ def live_trading_all_us_stocks():
             if time.time() - last_report_time >= 3600:
                 send_account_report(ig)
                 last_report_time = time.time()
+
+            if not _bot_state.get("running", True):
+                time.sleep(10)
+                continue
 
             signals = scan_all_markets(ig, mapping)
             _bot_state["last_scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
