@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 
 from dotenv import load_dotenv
 
+try:
+    import anthropic as _anthropic
+    _ANTHROPIC_OK = True
+except ImportError:
+    _ANTHROPIC_OK = False
+
 # ================== LOAD ENV ==================
 load_dotenv()
 
@@ -23,6 +29,7 @@ IG_DEMO        = os.getenv("IG_ACCOUNT_TYPE", "DEMO").upper() == "DEMO"
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
 
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 DEFAULT_SIZE   = float(os.getenv("DEFAULT_SIZE", "1"))
@@ -60,6 +67,7 @@ MENU = (
     "5 - Place order\n"
     "6 - Stop bot\n"
     "7 - Start bot\n"
+    "8 - Top losers + Claude entry analysis\n"
     "0 - Show this menu"
 )
 
@@ -162,6 +170,9 @@ def tg_handle_command(text: str):
     elif cmd == "7":
         _bot_state["running"] = True
         tg_send("▶️ Bot resumed. Auto-scanning active.")
+
+    elif cmd == "8":
+        threading.Thread(target=analyze_top_losers, daemon=True).start()
 
     else:
         tg_send(MENU)
@@ -568,6 +579,134 @@ def send_account_report(ig: IGClient):
     )
     tg_send(msg)
     logging.info("Account report sent")
+
+# ================== CLAUDE TOP-LOSERS ANALYSIS ==================
+def _get_top_losers(n=5):
+    """Return list of (ticker, pct_change, current_price) for the biggest losers today."""
+    results = []
+    raw = yf.download(US_UNIVERSE, period="2d", interval="1d", progress=False, group_by="ticker")
+    for ticker in US_UNIVERSE:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                closes = raw[ticker]["Close"].dropna()
+            else:
+                closes = raw["Close"].dropna()
+            if len(closes) < 2:
+                continue
+            prev_close = float(closes.iloc[-2])
+            today_close = float(closes.iloc[-1])
+            pct = (today_close - prev_close) / prev_close * 100
+            results.append((ticker, pct, today_close))
+        except Exception:
+            continue
+    results.sort(key=lambda x: x[1])
+    return results[:n]
+
+
+def _ichimoku_summary(ticker: str):
+    """Return a brief Ichimoku signal string for a ticker (60 days, 1h bars)."""
+    try:
+        df = yf.download(ticker, period="60d", interval="1h", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 60:
+            return "insufficient data"
+        df = ichimoku(df)
+        df.dropna(inplace=True)
+        if df.empty:
+            return "insufficient data after Ichimoku"
+        last = df.iloc[-1]
+        price = float(last["Close"])
+        cloud_top = max(float(last["senkou_a"]), float(last["senkou_b"]))
+        cloud_bot = min(float(last["senkou_a"]), float(last["senkou_b"]))
+        above = price > cloud_top
+        below = price < cloud_bot
+        tenkan = float(last["tenkan"])
+        kijun = float(last["kijun"])
+        tk_bull = tenkan > kijun
+
+        # Fibonacci from last 20 bars
+        fib_0, fib_382, fib_618, fib_900 = build_fibonacci(df, len(df) - 1)
+
+        signal = "above cloud" if above else ("below cloud" if below else "inside cloud")
+        tk = "TK bullish" if tk_bull else "TK bearish"
+        fib_zone = ""
+        if above:
+            if fib_618 < price <= fib_382:
+                fib_zone = " | at 38.2% Fib (entry zone)"
+            elif fib_900 < price <= fib_618:
+                fib_zone = " | at 61.8% Fib (deeper entry zone)"
+
+        return (f"{signal} | {tk}{fib_zone} | "
+                f"Price={price:.2f} Cloud={cloud_bot:.2f}-{cloud_top:.2f} "
+                f"Fib38={fib_382:.2f} Fib62={fib_618:.2f}")
+    except Exception as e:
+        return f"error: {e}"
+
+
+def analyze_top_losers():
+    """Fetch top 5 losers, run Ichimoku on each, ask Claude for entry recommendations."""
+    if not _ANTHROPIC_OK:
+        tg_send("⚠️ anthropic package not installed. Run: pip install anthropic")
+        return
+    if not CLAUDE_API_KEY:
+        tg_send("⚠️ CLAUDE_API_KEY not set in .env")
+        return
+
+    tg_send("🔍 Fetching today's top losers from US_UNIVERSE...")
+    try:
+        losers = _get_top_losers(5)
+    except Exception as e:
+        tg_send(f"⚠️ Failed to fetch top losers: {e}")
+        return
+
+    if not losers:
+        tg_send("No loser data available today.")
+        return
+
+    lines = ["📉 Top 5 Losers today:"]
+    analysis_data = []
+    for ticker, pct, price in losers:
+        summary = _ichimoku_summary(ticker)
+        lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
+        analysis_data.append(f"- {ticker}: {pct:+.2f}% change, price ${price:.2f}\n  Ichimoku: {summary}")
+
+    tg_send("\n".join(lines))
+    tg_send("🤖 Asking Claude for entry analysis...")
+
+    prompt = (
+        "You are an expert technical analyst using the Ichimoku + Fibonacci strategy.\n\n"
+        "Today's top losers from the US_UNIVERSE watchlist with their Ichimoku analysis:\n\n"
+        + "\n".join(analysis_data)
+        + "\n\nFor each ticker:\n"
+        "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fibonacci)\n"
+        "2. If yes, what is the entry price zone, take-profit, and stop-loss?\n"
+        "3. Rank the top 2 best entries by risk/reward.\n\n"
+        "Be concise. Format the response for a Telegram message (max 4000 chars)."
+    )
+
+    try:
+        client = _anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        with client.messages.stream(
+            model="claude-opus-4-7",
+            max_tokens=1500,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            msg = stream.get_final_message()
+
+        reply = ""
+        for block in msg.content:
+            if block.type == "text":
+                reply += block.text
+
+        if reply:
+            tg_send(f"🧠 Claude Analysis:\n{reply[:4000]}")
+        else:
+            tg_send("Claude returned no text response.")
+    except Exception as e:
+        tg_send(f"⚠️ Claude API error: {e}")
+
 
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
 def live_trading_all_us_stocks():
