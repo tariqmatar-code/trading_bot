@@ -69,6 +69,7 @@ MENU = (
     "7 - Stop bot\n"
     "8 - Start bot\n"
     "9 - Top losers + most active (Claude AI)\n"
+    "10 - Check orders in place (IG)\n"
     "0 - Show this menu\n"
     "\n💡 Quick: type  buy  or  sell  to start guided order\n"
     "   Or direct: BUY AAPL 1 / SELL TSLA 2"
@@ -343,6 +344,12 @@ def tg_handle_command(text: str):
     elif cmd == "9":
         threading.Thread(target=analyze_top_losers, daemon=True).start()
 
+    elif cmd == "10":
+        if ig:
+            threading.Thread(target=send_orders_report, args=(ig,), daemon=True).start()
+        else:
+            tg_send("⚠️ Bot not connected yet.")
+
     else:
         tg_send(MENU)
 
@@ -442,6 +449,14 @@ class IGClient:
             "orderType": "MARKET"
         }
         return self._request("POST", url, json=data, headers=headers).json()
+
+    def get_positions(self):
+        """Return all open positions from IG."""
+        return self._request("GET", f"{self.base}/positions").json().get("positions", [])
+
+    def get_working_orders(self):
+        """Return all pending (working) orders from IG."""
+        return self._request("GET", f"{self.base}/workingorders").json().get("workingOrders", [])
 
 # ================== IG HELPERS ==================
 def ig_prices_to_df(data):
@@ -707,6 +722,66 @@ def scan_all_markets(ig: IGClient, mapping):
         except Exception as e:
             logging.error(f"Error scanning {epic}: {e}")
     return signals
+
+# ================== ORDERS REPORT ==================
+def send_orders_report(ig: IGClient):
+    """Send all open positions + pending working orders to Telegram."""
+    lines = ["📋 Orders In Place\n"]
+
+    # ── Open positions (filled trades) ──────────────────────
+    try:
+        positions = ig.get_positions()
+        if positions:
+            lines.append("🟢 Open Positions:")
+            for p in positions:
+                pos = p.get("position", {})
+                mkt = p.get("market", {})
+                name      = mkt.get("instrumentName", mkt.get("epic", "?"))
+                direction = pos.get("direction", "?")
+                size      = pos.get("size", "?")
+                entry     = pos.get("openLevel", pos.get("level", "?"))
+                upl       = pos.get("upl", "?")
+                deal_id   = pos.get("dealId", "?")
+                curr_price = mkt.get("bid", "?")
+                lines.append(
+                    f"  {name}\n"
+                    f"  {direction} x{size}\n"
+                    f"  Buy: ${entry}  Now: ${curr_price}  P&L: {upl}\n"
+                    f"  Deal: {deal_id}"
+                )
+        else:
+            lines.append("🟢 Open Positions: none")
+    except Exception as e:
+        lines.append(f"🟢 Open Positions: error — {e}")
+
+    lines.append("")
+
+    # ── Working (pending) orders ─────────────────────────────
+    try:
+        working = ig.get_working_orders()
+        if working:
+            lines.append("⏳ Pending Orders:")
+            for w in working:
+                wo  = w.get("workingOrder", {})
+                mkt = w.get("market", {})
+                name      = mkt.get("instrumentName", mkt.get("epic", "?"))
+                direction = wo.get("direction", "?")
+                size      = wo.get("size", "?")
+                order_type = wo.get("orderType", "?")
+                level     = wo.get("level", "?")
+                deal_id   = wo.get("dealId", "?")
+                lines.append(
+                    f"  {name}\n"
+                    f"  {direction} x{size} ({order_type}) @ ${level}\n"
+                    f"  Deal: {deal_id}"
+                )
+        else:
+            lines.append("⏳ Pending Orders: none")
+    except Exception as e:
+        lines.append(f"⏳ Pending Orders: error — {e}")
+
+    tg_send("\n".join(lines))
+
 
 # ================== ACCOUNT REPORT ==================
 def send_account_report(ig: IGClient):
