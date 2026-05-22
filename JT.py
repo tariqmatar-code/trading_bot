@@ -85,7 +85,8 @@ _bot_state = {
     "awaiting_order": False,
     "awaiting_confirm": None,   # pending order dict waiting for y/n
     "awaiting_close": None,     # list of open positions waiting for number
-    "awaiting_trade": None,     # guided buy/sell: {step, direction, ticker, size}
+    "awaiting_trade": None,          # guided buy/sell: {step, direction, ticker, size}
+    "awaiting_close_confirm": None,  # pending close waiting for y/n
 }
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
@@ -128,6 +129,38 @@ def tg_handle_command(text: str):
             tg_send("❌ Order cancelled.")
         return
 
+    # ── Close: confirm step (y/n after seeing buy/sell prices) ──
+    if _bot_state.get("awaiting_close_confirm") is not None:
+        pending = _bot_state["awaiting_close_confirm"]
+        _bot_state["awaiting_close_confirm"] = None
+        if cmd.lower() not in ("y", "yes"):
+            tg_send("❌ Close cancelled.")
+            return
+        epic      = pending["epic"]
+        deal_id   = pending["deal_id"]
+        entry     = pending["entry"]
+        sl        = pending["sl"]
+        sig       = pending["sig"]
+        ticker    = pending["ticker"]
+        sell_price = pending["sell_price"]
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        try:
+            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
+            pnl = sell_price - entry
+            _bot_state["trade_log"].append(pnl)
+            _bot_state["open_positions"].pop(epic, None)
+            tg_send(
+                f"✅ Position closed — {ticker} ({sig})\n"
+                f"📥 Bought @ ${entry:.2f}\n"
+                f"📤 Sold   @ ${sell_price:.2f}\n"
+                f"💰 P&L:     {pnl:+.2f}"
+            )
+        except Exception as e:
+            tg_send(f"❌ Close failed: {e}")
+        return
+
     # ── Close position by number ───────────────────────────
     if _bot_state.get("awaiting_close") is not None:
         pos_list = _bot_state["awaiting_close"]
@@ -143,23 +176,20 @@ def tg_handle_command(text: str):
             tg_send("Invalid selection. Cancelled.")
             return
         epic, (deal_id, entry, tp, sl, sig, ticker) = pos_list[idx]
-        if not ig:
-            tg_send("⚠️ Bot not connected.")
-            return
-        try:
-            sell_price = get_realtime_price(ticker) or sl
-            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
-            pnl = sell_price - entry
-            _bot_state["trade_log"].append(pnl)
-            _bot_state["open_positions"].pop(epic, None)
-            tg_send(
-                f"✅ Closed {ticker} ({sig})\n"
-                f"Buy:  ${entry:.2f}\n"
-                f"Sell: ${sell_price:.2f}\n"
-                f"P&L:  {pnl:+.2f}"
-            )
-        except Exception as e:
-            tg_send(f"❌ Close failed: {e}")
+        sell_price = get_realtime_price(ticker) or sl
+        pnl        = sell_price - entry
+        # Store pending close and ask for confirmation
+        _bot_state["awaiting_close_confirm"] = {
+            "epic": epic, "deal_id": deal_id, "entry": entry,
+            "sl": sl, "sig": sig, "ticker": ticker, "sell_price": sell_price,
+        }
+        tg_send(
+            f"⚠️ Confirm close {ticker} ({sig})\n"
+            f"📥 Bought @ ${entry:.2f}\n"
+            f"📤 Sell   @ ${sell_price:.2f}\n"
+            f"💰 P&L:     {pnl:+.2f}\n\n"
+            f"Reply y to confirm or n to cancel"
+        )
         return
 
     # ── Guided trade flow (multi-step) ────────────────────
