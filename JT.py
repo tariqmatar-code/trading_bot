@@ -64,11 +64,13 @@ MENU = (
     "2 - Open positions\n"
     "3 - Trading stats\n"
     "4 - Bot status\n"
-    "5 - Place order\n"
-    "6 - Stop bot\n"
-    "7 - Start bot\n"
-    "8 - Top losers + most active (Claude AI)\n"
-    "0 - Show this menu"
+    "5 - Buy stock\n"
+    "6 - Sell / Close position\n"
+    "7 - Stop bot\n"
+    "8 - Start bot\n"
+    "9 - Top losers + most active (Claude AI)\n"
+    "0 - Show this menu\n"
+    "\n💡 Quick trade: type  BUY TSLA 1  or  SELL MSFT 2  anytime"
 )
 
 # Shared state for Telegram listener
@@ -80,39 +82,95 @@ _bot_state = {
     "last_scan": None,
     "running": True,
     "awaiting_order": False,
+    "awaiting_confirm": None,   # pending order dict waiting for y/n
+    "awaiting_close": None,     # list of open positions waiting for number
 }
+
+def _execute_order(ig, direction: str, ticker: str, size: float):
+    """Place an order and send Telegram confirmation."""
+    try:
+        epic = get_epic(ig, ticker)
+        if not epic:
+            tg_send(f"⚠️ Could not find EPIC for {ticker}.")
+            return
+        res = ig.place_order(epic, direction, size)
+        ref = res.get("dealReference", "N/A")
+        tg_send(f"✅ {direction} {ticker} x{size} placed\nRef: {ref}")
+    except Exception as e:
+        tg_send(f"❌ Order failed: {e}")
+
 
 def tg_handle_command(text: str):
     cmd = text.strip()
     ig  = _bot_state.get("ig")
 
-    # Handle pending order input: "BUY TSLA 1" or "SELL MSFT 2"
-    if _bot_state.get("awaiting_order"):
-        _bot_state["awaiting_order"] = False
-        parts = cmd.upper().split()
-        if len(parts) == 3 and parts[0] in ("BUY", "SELL"):
-            direction, ticker, size = parts[0], parts[1], parts[2]
-            try:
-                size = float(size)
-            except ValueError:
-                tg_send("Invalid size. Order cancelled.")
-                return
+    # ── Confirm pending buy/sell (y / n) ──────────────────
+    if _bot_state.get("awaiting_confirm"):
+        order = _bot_state["awaiting_confirm"]
+        _bot_state["awaiting_confirm"] = None
+        if cmd.lower() in ("y", "yes"):
             if not ig:
                 tg_send("⚠️ Bot not connected.")
                 return
-            try:
-                epic = get_epic(ig, ticker)
-                if not epic:
-                    tg_send(f"Could not find EPIC for {ticker}.")
-                    return
-                res = ig.place_order(epic, direction, size)
-                tg_send(f"✅ Order placed: {direction} {ticker} x{size}\nRef: {res.get('dealReference','N/A')}")
-            except Exception as e:
-                tg_send(f"❌ Order failed: {e}")
+            threading.Thread(
+                target=_execute_order,
+                args=(ig, order["direction"], order["ticker"], order["size"]),
+                daemon=True
+            ).start()
         else:
-            tg_send("Format: BUY TSLA 1 or SELL MSFT 2\nOrder cancelled.")
+            tg_send("❌ Order cancelled.")
         return
 
+    # ── Close position by number ───────────────────────────
+    if _bot_state.get("awaiting_close") is not None:
+        pos_list = _bot_state["awaiting_close"]
+        _bot_state["awaiting_close"] = None
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        try:
+            idx = int(cmd) - 1
+            if idx < 0 or idx >= len(pos_list):
+                raise ValueError
+        except ValueError:
+            tg_send("Invalid selection. Cancelled.")
+            return
+        epic, (deal_id, entry, tp, sl, sig, ticker) = pos_list[idx]
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        try:
+            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
+            last_price = get_realtime_price(ticker) or sl
+            pnl = last_price - entry
+            _bot_state["trade_log"].append(pnl)
+            _bot_state["open_positions"].pop(epic, None)
+            tg_send(f"✅ Closed {ticker} ({sig})\nEntry: {entry:.2f} → Exit: {last_price:.2f}\nP&L: {pnl:+.2f}")
+        except Exception as e:
+            tg_send(f"❌ Close failed: {e}")
+        return
+
+    # ── Direct trade: BUY TSLA / BUY TSLA 2 / SELL MSFT ──
+    parts = cmd.upper().split()
+    if len(parts) >= 2 and parts[0] in ("BUY", "SELL"):
+        direction = parts[0]
+        ticker    = parts[1]
+        try:
+            size = float(parts[2]) if len(parts) >= 3 else DEFAULT_SIZE
+        except ValueError:
+            tg_send("Invalid size. Example: BUY TSLA 1")
+            return
+        price = get_realtime_price(ticker)
+        price_str = f"@ ${price:.2f}" if price else ""
+        _bot_state["awaiting_confirm"] = {"direction": direction, "ticker": ticker, "size": size}
+        tg_send(
+            f"⚠️ Confirm order:\n"
+            f"{direction} {ticker} x{size} {price_str}\n"
+            f"Reply y to confirm or n to cancel"
+        )
+        return
+
+    # ── Menu commands ──────────────────────────────────────
     if cmd == "0":
         tg_send(MENU)
 
@@ -160,18 +218,38 @@ def tg_handle_command(text: str):
         )
 
     elif cmd == "5":
-        tg_send("Send order in format:\nBUY TSLA 1\nor\nSELL MSFT 2")
-        _bot_state["awaiting_order"] = True
+        tg_send(
+            "📈 BUY a stock\n"
+            "Type: BUY <TICKER> <SIZE>\n"
+            "Example: BUY TSLA 1\n"
+            "         BUY AAPL 2\n\n"
+            "Or just: BUY TSLA  (uses default size)"
+        )
 
     elif cmd == "6":
-        _bot_state["running"] = False
-        tg_send("⏸ Bot paused. Auto-scanning stopped.\nSend 7 to resume.")
+        pos = _bot_state.get("open_positions", {})
+        if not pos:
+            tg_send("No open positions to close.")
+            return
+        lines = ["📂 Select position to close (reply with number):"]
+        pos_list = list(pos.items())
+        for i, (epic, (deal_id, entry, tp, sl, sig, ticker)) in enumerate(pos_list, 1):
+            last_price = get_realtime_price(ticker)
+            pnl_str = f"  P&L: {last_price - entry:+.2f}" if last_price else ""
+            lines.append(f"  {i}. {ticker} ({sig}) Entry:{entry:.2f}{pnl_str}")
+        lines.append("\nReply n to cancel")
+        _bot_state["awaiting_close"] = pos_list
+        tg_send("\n".join(lines))
 
     elif cmd == "7":
+        _bot_state["running"] = False
+        tg_send("⏸ Bot paused. Auto-scanning stopped.\nSend 8 to resume.")
+
+    elif cmd == "8":
         _bot_state["running"] = True
         tg_send("▶️ Bot resumed. Auto-scanning active.")
 
-    elif cmd == "8":
+    elif cmd == "9":
         threading.Thread(target=analyze_top_losers, daemon=True).start()
 
     else:
