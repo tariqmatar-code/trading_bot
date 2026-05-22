@@ -5,3 +5,4 @@ __pycache__/
 logs/
 reports/
 *.log
+epic_cache.json

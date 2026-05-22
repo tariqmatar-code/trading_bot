@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import time
@@ -81,21 +82,25 @@ class IGClient:
             "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]
         })
 
+    def _request(self, method, url, **kwargs):
+        r = self.session.request(method, url, **kwargs)
+        if r.status_code == 403:
+            logging.info("IG session expired — re-authenticating")
+            self.auth()
+            r = self.session.request(method, url, **kwargs)
+        r.raise_for_status()
+        return r
+
     def prices(self, epic, resolution="H1", num=200):
         url = f"{self.base}/prices/{epic}/{resolution}/{num}"
-        r = self.session.get(url)
-        r.raise_for_status()
-        return r.json()
+        return self._request("GET", url).json()
 
     def search_markets(self, search_term):
         url = f"{self.base}/markets?searchTerm={search_term}"
-        r = self.session.get(url)
-        r.raise_for_status()
-        return r.json()
+        return self._request("GET", url).json()
 
     def place_order(self, epic, direction, size):
         url = f"{self.base}/positions/otc"
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         data = {
             "epic": epic,
             "direction": direction,
@@ -104,26 +109,18 @@ class IGClient:
             "currencyCode": "USD",
             "forceOpen": True
         }
-        r = self.session.post(url, headers=headers, data=json.dumps(data))
-        r.raise_for_status()
-        return r.json()
+        return self._request("POST", url, json=data).json()
 
     def close_position(self, deal_id, direction, size):
         url = f"{self.base}/positions/otc"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "_method": "DELETE"
-        }
+        headers = {"_method": "DELETE"}
         data = {
             "dealId": deal_id,
             "direction": direction,
             "size": size,
             "orderType": "MARKET"
         }
-        r = self.session.post(url, headers=headers, data=json.dumps(data))
-        r.raise_for_status()
-        return r.json()
+        return self._request("POST", url, json=data, headers=headers).json()
 
 # ================== IG HELPERS ==================
 def ig_prices_to_df(data):
@@ -155,9 +152,12 @@ def get_epic(ig: IGClient, ticker: str):
         return None
 
 # ================== TICKER UNIVERSE ==================
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"}
+
 def load_sp500_tickers():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    html = requests.get(url, headers=_HEADERS, timeout=15).text
+    tables = pd.read_html(io.StringIO(html))
     df = tables[0]
     tickers = df['Symbol'].tolist()
     tickers = [t.replace('.', '-') for t in tickers]
@@ -165,9 +165,10 @@ def load_sp500_tickers():
 
 def load_nasdaq100_tickers():
     url = "https://en.wikipedia.org/wiki/NASDAQ-100"
-    tables = pd.read_html(url)
-    df = tables[3] if len(tables) > 3 else tables[0]
-    col = [c for c in df.columns if 'Ticker' in str(c)][0]
+    html = requests.get(url, headers=_HEADERS, timeout=15).text
+    tables = pd.read_html(io.StringIO(html))
+    df = next(t for t in tables if 'Ticker' in t.columns)
+    col = 'Ticker'
     tickers = df[col].dropna().tolist()
     tickers = [t.replace('.', '-') for t in tickers]
     return tickers
@@ -178,13 +179,29 @@ def load_us_stock_universe():
     universe = sorted(set(sp + ndx))
     return universe
 
+EPIC_CACHE_FILE = "epic_cache.json"
+
 def build_epic_universe(ig: IGClient):
+    if os.path.exists(EPIC_CACHE_FILE):
+        with open(EPIC_CACHE_FILE) as f:
+            mapping = json.load(f)
+        logging.info(f"Loaded {len(mapping)} EPICs from cache")
+        tg_send(f"Loaded {len(mapping)} EPICs from cache")
+        return [tuple(x) for x in mapping]
+
     tickers = load_us_stock_universe()
-    mapping = []  # list of (ticker, epic)
-    for t in tickers:
+    mapping = []
+    for i, t in enumerate(tickers):
         epic = get_epic(ig, t)
         if epic:
             mapping.append((t, epic))
+        if i % 50 == 0:
+            logging.info(f"EPIC lookup progress: {i}/{len(tickers)}")
+        time.sleep(0.3)
+
+    with open(EPIC_CACHE_FILE, "w") as f:
+        json.dump(mapping, f)
+    logging.info(f"Built and cached {len(mapping)} EPICs")
     return mapping
 
 # ================== REAL-TIME PRICE (YAHOO) ==================
@@ -221,64 +238,79 @@ def find_chikou_breakout(df):
             return i
     return None
 
+def find_all_chikou_breakouts(df):
+    breakouts = []
+    for i in range(60, len(df) - 26):
+        chikou = float(df['chikou'].iloc[i])
+        cloud_top = max(float(df['senkou_a'].iloc[i]), float(df['senkou_b'].iloc[i]))
+        prev_chikou = float(df['chikou'].iloc[i - 1])
+        if prev_chikou <= cloud_top and chikou > cloud_top:
+            breakouts.append(i)
+    return breakouts
+
 def build_fibonacci(df, idx):
-    fib_0 = df['High'].iloc[idx]  # 0% = high of penetration candle
-    window = df.iloc[max(0, idx-5): idx+6]
-    fib_100 = window['Low'].min()  # 100% = nearest bottom
+    fib_0 = df['High'].iloc[max(0, idx-20): idx+1].max()  # swing high over 20 bars
+    window = df.iloc[max(0, idx-20): idx+1]
+    fib_100 = window['Low'].min()  # swing low over 20 bars
     fib_382 = fib_0 - 0.382 * (fib_0 - fib_100)
     fib_618 = fib_0 - 0.618 * (fib_0 - fib_100)
     fib_900 = fib_0 - 0.900 * (fib_0 - fib_100)
     return fib_0, fib_382, fib_618, fib_900
 
 def trend_ok(df, i):
-    price = df['Close'].iloc[i]
-    cloud_top = max(df['senkou_a'].iloc[i], df['senkou_b'].iloc[i])
-    chikou = df['chikou'].iloc[i]
-    tenkan = df['tenkan'].iloc[i]
-    kijun = df['kijun'].iloc[i]
-    return price > cloud_top and chikou > price and tenkan > kijun
+    price = float(df['Close'].iloc[i])
+    cloud_top = max(float(df['senkou_a'].iloc[i]), float(df['senkou_b'].iloc[i]))
+    return price > cloud_top
 
 # ================== BACKTEST ==================
 def backtest(df, initial_balance=INITIAL_BALANCE, plot=True):
     df = ichimoku(df)
     df.dropna(inplace=True)
 
-    idx = find_chikou_breakout(df)
-    if idx is None:
+    breakouts = find_all_chikou_breakouts(df)
+    if not breakouts:
         return initial_balance, [], "No Chikou breakout found."
 
-    fib_0, fib_382, fib_618, fib_900 = build_fibonacci(df, idx)
-    tp = fib_382 * 1.03
-
+    breakout_set = set(breakouts)
     balance = initial_balance
     equity_curve = []
     trades = []
     position = None
     entry_price = None
+    fib_382 = fib_618 = fib_900 = tp = None
+    last_breakout_bar = -50
 
-    for i in range(idx, len(df)):
-        price = df['Close'].iloc[i]
+    for i in range(breakouts[0], len(df)):
+        price = float(df['Close'].iloc[i])
 
-        if not trend_ok(df, i):
+        # New breakout: update Fibonacci levels if no open position
+        if i in breakout_set and position is None and i > last_breakout_bar + 5:
+            _, fib_382, fib_618, fib_900 = build_fibonacci(df, i)
+            tp = fib_0 = float(df['High'].iloc[i])
+            last_breakout_bar = i
+
+        if fib_382 is None or not trend_ok(df, i):
             equity_curve.append(balance)
             continue
 
         if position is None:
-            if price <= fib_382 and price > fib_618:
+            if fib_618 < price <= fib_382:
                 position = "LONG_38"
                 entry_price = price
-            elif price <= fib_618 and price > fib_900:
+                tp = fib_382 * 1.03
+            elif fib_900 < price <= fib_618:
                 position = "LONG_61"
                 entry_price = price
+                tp = fib_382 * 1.03
 
         if position:
             if price >= tp:
-                pnl = (tp - entry_price)
+                pnl = tp - entry_price
                 balance += pnl
                 trades.append(pnl)
                 position = None
             elif price <= fib_900:
-                pnl = (fib_900 - entry_price)
+                pnl = fib_900 - entry_price
                 balance += pnl
                 trades.append(pnl)
                 position = None
@@ -325,6 +357,8 @@ MaxDD:   {dd*100:.2f}%
 
 def backtest_single_ticker(ticker="CLSK"):
     df = yf.download(ticker, period="3y", interval="1d")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     if df.empty:
         print("No data for", ticker)
         return
@@ -436,7 +470,8 @@ def live_trading_all_us_stocks():
 # ================== MAIN ==================
 if __name__ == "__main__":
     # 1) Optional: quick backtest
-    # backtest_single_ticker("CLSK")
+    # backtest_single_ticker("TSLA")
+    # backtest_single_ticker("APP")
 
     # 2) Start live trading on all US stocks (S&P500 + NASDAQ100)
     live_trading_all_us_stocks()
