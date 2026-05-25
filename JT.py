@@ -508,10 +508,13 @@ def tg_handle_command(text: str):
                 current = get_realtime_price(ticker)
                 pnl_str = f"  P&L: {current - entry:+.2f}" if current else ""
                 price_str = f"  Now: ${current:.2f}" if current else ""
+                # SYNCED positions have no known TP/SL — show dashes.
+                tp_str = f"${tp:.2f}" if (sig != "SYNCED" and tp) else "—"
+                sl_str = f"${sl:.2f}" if (sig != "SYNCED" and sl) else "—"
                 lines.append(
                     f"  {ticker} ({sig})\n"
                     f"  Buy: ${entry:.2f}{price_str}{pnl_str}\n"
-                    f"  TP: ${tp:.2f}  SL: ${sl:.2f}"
+                    f"  TP: {tp_str}  SL: {sl_str}"
                 )
             tg_send("\n".join(lines))
 
@@ -2207,6 +2210,64 @@ def analyze_top_losers():
 
 
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
+def _sync_positions_from_broker(broker):
+    """Populate _bot_state['open_positions'] with whatever the broker already has.
+    Avoids losing track of positions across bot restarts. Synced positions get
+    sig_type='SYNCED' and are skipped by the auto-exit loop (no TP/SL known)."""
+    try:
+        positions = broker.get_positions()
+    except Exception as e:
+        tg_send(f"⚠️ Startup sync: could not fetch positions: {e}")
+        positions = []
+    try:
+        working = broker.get_working_orders()
+    except Exception as e:
+        logging.error(f"Startup sync working_orders: {e}")
+        working = []
+
+    open_positions = _bot_state.setdefault("open_positions", {})
+    synced = 0
+    for p in positions:
+        pos = p.get("position", {})
+        mkt = p.get("market", {})
+        symbol = mkt.get("epic") or pos.get("dealId")
+        if not symbol:
+            continue
+        try:
+            entry = float(pos.get("openLevel") or pos.get("level") or 0)
+        except (TypeError, ValueError):
+            entry = 0.0
+        # Use 0/0 sentinels for TP/SL — exit loop skips SYNCED positions
+        open_positions[symbol] = (symbol, entry, 0.0, 0.0, "SYNCED", symbol)
+        synced += 1
+
+    if synced or working:
+        lines = ["🔄 Startup sync:"]
+        if synced:
+            lines.append(f"  Synced {synced} open position(s) — tracked as 'SYNCED' (auto-exit disabled).")
+            for p in positions:
+                pos = p.get("position", {})
+                mkt = p.get("market", {})
+                lines.append(
+                    f"    • {mkt.get('instrumentName','?')} "
+                    f"{pos.get('direction','?')} x{pos.get('size','?')} "
+                    f"@ {pos.get('openLevel','?')}"
+                )
+        if working:
+            lines.append(f"  Found {len(working)} pending order(s) — use cmd 15 to cancel.")
+            for w in working:
+                wo = w.get("workingOrder", {}) or w.get("workingOrderData", {})
+                mkt = w.get("market", {}) or w.get("marketData", {})
+                lines.append(
+                    f"    • {mkt.get('instrumentName','?')} "
+                    f"{wo.get('direction','?')} "
+                    f"x{wo.get('size') or wo.get('orderSize','?')}"
+                )
+        tg_send("\n".join(lines))
+    else:
+        tg_send("✅ Startup sync: no existing positions or pending orders.")
+
+
 def live_trading_all_us_stocks():
     if BROKER == "ALPACA":
         ig = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
@@ -2221,6 +2282,7 @@ def live_trading_all_us_stocks():
     threading.Thread(target=_watch_list_loop, daemon=True).start()
 
     tg_send(f"🤖 Bot Started — broker: {broker_label} (Top 30 US Stocks)")
+    _sync_positions_from_broker(ig)
     tg_send(MENU)
 
     mapping = build_epic_universe(ig)  # list of (ticker, epic)
@@ -2281,6 +2343,11 @@ def live_trading_all_us_stocks():
             # Exits (using Yahoo for latest price)
             for epic in list(open_positions.keys()):
                 deal_id, entry_price, tp, sl, sig_type, ticker = open_positions[epic]
+
+                # Skip positions synced at startup — no known TP/SL.
+                # User must close them manually via cmd 6 / 17.
+                if sig_type == "SYNCED":
+                    continue
 
                 last_price = get_realtime_price(ticker)
                 if last_price is None:
