@@ -913,7 +913,12 @@ class AlpacaClient:
             return {"markets": []}
 
     def place_order(self, epic, direction, size):
-        """epic == symbol for Alpaca. direction = 'BUY' or 'SELL'."""
+        """epic == symbol for Alpaca. direction = 'BUY' or 'SELL'.
+
+        Returns the SYMBOL (not the order UUID) as dealReference/dealId,
+        because Alpaca's close-position endpoint takes a symbol. The order
+        UUID is logged for traceability.
+        """
         side = self._OrderSide.BUY if direction.upper() == "BUY" else self._OrderSide.SELL
         req = self._MarketOrderRequest(
             symbol=epic,
@@ -922,17 +927,33 @@ class AlpacaClient:
             time_in_force=self._TimeInForce.DAY,
         )
         order = self.client.submit_order(req)
-        return {"dealReference": str(order.id), "dealId": str(order.id)}
+        logging.info(f"Alpaca order placed: id={order.id} symbol={epic} side={direction} qty={size}")
+        return {"dealReference": epic, "dealId": epic, "alpacaOrderId": str(order.id)}
 
     def close_position(self, deal_id, direction, size):
-        """For Alpaca, deal_id is the symbol (mapped that way in get_positions)."""
+        """Close by symbol. Falls back to order-ID lookup for legacy (UUID) deal_ids
+        left in open_positions from before the place_order fix."""
+        symbol = deal_id
+        # Detect UUID format (8-4-4-4-12)
+        if isinstance(deal_id, str) and len(deal_id) == 36 and deal_id.count("-") == 4:
+            try:
+                order = self.client.get_order_by_id(deal_id)
+                symbol = order.symbol
+                logging.info(f"close_position: resolved UUID {deal_id} -> symbol {symbol}")
+            except Exception as e:
+                logging.error(f"close_position: could not resolve order id {deal_id}: {e}")
         try:
             self.client.close_position(
-                deal_id,
+                symbol,
                 close_options=self._ClosePositionRequest(qty=str(size)),
             )
-            return {"dealReference": deal_id}
+            return {"dealReference": symbol}
         except Exception as e:
+            # Treat "no position found" as already-closed so the caller can clean up
+            err_str = str(e)
+            if "position not found" in err_str.lower() or "40410000" in err_str:
+                logging.info(f"close_position: no position for {symbol} on Alpaca — treating as already closed")
+                return {"dealReference": symbol, "alreadyClosed": True}
             raise Exception(f"Alpaca close failed: {e}")
 
     def get_positions(self):
