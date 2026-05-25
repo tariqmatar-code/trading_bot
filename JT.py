@@ -848,7 +848,7 @@ def _yf_screener(scr_id: str, n: int = 5):
         return []
 
 
-def _get_top_losers(n=5):
+def _get_top_losers(n=10):
     """Top losers today from Yahoo Finance day_losers screener."""
     quotes = _yf_screener("day_losers", n)
     results = []
@@ -879,7 +879,7 @@ def _get_top_losers(n=5):
     return results
 
 
-def _get_most_active(n=5):
+def _get_most_active(n=10):
     """Most active stocks today from Yahoo Finance most_actives screener."""
     quotes = _yf_screener("most_actives", n)
     results = []
@@ -946,14 +946,14 @@ def analyze_top_losers():
 
     # ── Top losers ──────────────────────────────────────────
     try:
-        losers = _get_top_losers(5)
+        losers = _get_top_losers(10)
     except Exception as e:
         tg_send(f"⚠️ Failed to fetch top losers: {e}")
         losers = []
 
     # ── Most active ─────────────────────────────────────────
     try:
-        actives = _get_most_active(5)
+        actives = _get_most_active(10)
     except Exception as e:
         tg_send(f"⚠️ Failed to fetch most active: {e}")
         actives = []
@@ -964,13 +964,13 @@ def analyze_top_losers():
 
     # ── Send raw lists to Telegram ───────────────────────────
     if losers:
-        lines = ["📉 Top 5 Losers today:"]
+        lines = ["📉 Top 10 Losers today:"]
         for ticker, pct, price in losers:
             lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
         tg_send("\n".join(lines))
 
     if actives:
-        lines = ["🔥 Top 5 Most Active today:"]
+        lines = ["🔥 Top 10 Most Active today:"]
         for ticker, pct, price, vol in actives:
             vol_str = f"{vol/1_000_000:.1f}M" if vol >= 1_000_000 else f"{vol/1_000:.0f}K"
             lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}  Vol {vol_str}")
