@@ -41,6 +41,11 @@ CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 DEFAULT_SIZE   = float(os.getenv("DEFAULT_SIZE", "1"))
 
+# % of available cash to allocate per new auto-buy. 10 = 10% of wallet per trade.
+POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", "10"))
+# % above entry for take-profit. 3 = TP at entry × 1.03.
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT",   "3"))
+
 INITIAL_BALANCE = 10000
 
 # ================== LOGGING ==================
@@ -122,6 +127,7 @@ MENU = (
 _bot_state = {
     "ig": None,
     "open_positions": {},
+    "position_sizes": {},            # epic -> qty placed (so closes use the right size)
     "trade_log": [],
     "auto_buy_log": [],
     "start_time": time.time(),
@@ -143,6 +149,24 @@ _bot_state = {
     "auto_buy_enabled": True,
     "watch_list": [],                # [{ticker, level, direction}]
 }
+
+def _position_size_for(broker, price: float) -> float:
+    """Compute integer share qty so that the position uses POSITION_SIZE_PCT
+    of available cash. Falls back to DEFAULT_SIZE if the calc fails."""
+    if price is None or price <= 0:
+        return DEFAULT_SIZE
+    try:
+        acc = broker.get_account()
+        # Prefer 'available' (free cash); fall back to 'deposit'/'balance'.
+        cash_raw = acc.get("available") or acc.get("deposit") or acc.get("balance") or 0
+        cash = float(cash_raw) if not isinstance(cash_raw, str) or cash_raw.replace(".", "").isdigit() else 0
+        target_value = cash * (POSITION_SIZE_PCT / 100.0)
+        qty = int(target_value / price)
+        return max(1, qty)
+    except Exception as e:
+        logging.error(f"position size calc failed (price={price}): {e}")
+        return DEFAULT_SIZE
+
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
     """Place an order and send Telegram confirmation with fill price."""
@@ -202,13 +226,15 @@ def tg_handle_command(text: str):
         if not ig:
             tg_send("⚠️ Bot not connected.")
             return
+        size = _bot_state.get("position_sizes", {}).get(epic, DEFAULT_SIZE)
         try:
-            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
-            pnl = sell_price - entry
+            ig.close_position(deal_id, "SELL", size)
+            pnl = (sell_price - entry) * size
             _bot_state["trade_log"].append(pnl)
             _bot_state["open_positions"].pop(epic, None)
+            _bot_state.get("position_sizes", {}).pop(epic, None)
             tg_send(
-                f"✅ Position closed — {ticker} ({sig})\n"
+                f"✅ Position closed — {ticker} ({sig}) x{size}\n"
                 f"📥 Bought @ ${entry:.2f}\n"
                 f"📤 Sold   @ ${sell_price:.2f}\n"
                 f"💰 P&L:     {pnl:+.2f}"
@@ -1731,15 +1757,18 @@ def _force_close_all(ig):
         return
     tg_send(f"🚨 Force-closing {total} positions...")
     closed = 0
+    pos_sizes = _bot_state.setdefault("position_sizes", {})
     for epic, data in list(pos.items()):
         deal_id, entry, tp, sl, sig, ticker = data
+        size = pos_sizes.get(epic, DEFAULT_SIZE)
         try:
-            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
+            ig.close_position(deal_id, "SELL", size)
             sell_price = get_realtime_price(ticker) or entry
-            pnl = sell_price - entry
+            pnl = (sell_price - entry) * size
             _bot_state["trade_log"].append(pnl)
             pos.pop(epic, None)
-            tg_send(f"✅ Closed {ticker} ({sig}) P&L: {pnl:+.2f}")
+            pos_sizes.pop(epic, None)
+            tg_send(f"✅ Closed {ticker} ({sig}) x{size} P&L: {pnl:+.2f}")
             closed += 1
         except Exception as e:
             tg_send(f"❌ Close {ticker} failed: {e}")
@@ -2182,22 +2211,27 @@ def analyze_top_losers():
             tg_send(f"⚠️ Skip {ticker}: already have an open position.")
             continue
 
+        # Override Claude's TP with the configured % above entry
+        tp = entry * (1 + TAKE_PROFIT_PCT / 100.0)
+        size = _position_size_for(ig, entry)
         try:
-            res = ig.place_order(epic, "BUY", DEFAULT_SIZE)
+            res = ig.place_order(epic, "BUY", size)
             deal_ref = res.get("dealReference", "N/A")
             open_positions[epic] = (deal_ref, entry, tp, sl, "AUTO-BUY", ticker)
+            _bot_state.setdefault("position_sizes", {})[epic] = size
             _bot_state.setdefault("auto_buy_log", []).append({
                 "time": time.strftime("%Y-%m-%d %H:%M"),
                 "ticker": ticker,
                 "entry": entry,
                 "tp": tp,
                 "sl": sl,
+                "size": size,
                 "deal_ref": deal_ref,
             })
             tg_send(
-                f"🤖 AUTO-BUY {ticker} x{DEFAULT_SIZE}\n"
+                f"🤖 AUTO-BUY {ticker} x{size}\n"
                 f"📥 Entry: ${entry:.2f}\n"
-                f"🎯 TP:    ${tp:.2f}\n"
+                f"🎯 TP:    ${tp:.2f} (+{TAKE_PROFIT_PCT:.1f}%)\n"
                 f"🛑 SL:    ${sl:.2f}\n"
                 f"Ref: {deal_ref}"
             )
@@ -2226,6 +2260,7 @@ def _sync_positions_from_broker(broker):
         working = []
 
     open_positions = _bot_state.setdefault("open_positions", {})
+    pos_sizes      = _bot_state.setdefault("position_sizes", {})
     synced = 0
     for p in positions:
         pos = p.get("position", {})
@@ -2237,8 +2272,13 @@ def _sync_positions_from_broker(broker):
             entry = float(pos.get("openLevel") or pos.get("level") or 0)
         except (TypeError, ValueError):
             entry = 0.0
+        try:
+            size = float(pos.get("size") or 0) or DEFAULT_SIZE
+        except (TypeError, ValueError):
+            size = DEFAULT_SIZE
         # Use 0/0 sentinels for TP/SL — exit loop skips SYNCED positions
         open_positions[symbol] = (symbol, entry, 0.0, 0.0, "SYNCED", symbol)
+        pos_sizes[symbol] = size
         synced += 1
 
     if synced or working:
@@ -2332,11 +2372,18 @@ def live_trading_all_us_stocks():
             for epic, ticker, sig_type, price, tp, sl in signals:
                 if epic in open_positions:
                     continue
-                size = DEFAULT_SIZE
+                size = _position_size_for(ig, price)
+                tp   = price * (1 + TAKE_PROFIT_PCT / 100.0)  # override Fib TP with flat 3%
                 res = ig.place_order(epic, "BUY", size)
                 deal_ref = res.get("dealReference", "N/A")
                 open_positions[epic] = (deal_ref, price, tp, sl, sig_type, ticker)
-                msg = f"🟢 {sig_type} {epic} ({ticker})\nEntry: {price}\nTP: {tp}\nSL: {sl}"
+                _bot_state.setdefault("position_sizes", {})[epic] = size
+                msg = (
+                    f"🟢 {sig_type} {epic} ({ticker}) x{size}\n"
+                    f"Entry: ${price:.2f}\n"
+                    f"TP:    ${tp:.2f} (+{TAKE_PROFIT_PCT:.1f}%)\n"
+                    f"SL:    ${sl:.2f}"
+                )
                 tg_send(msg)
                 logging.info(msg)
 
@@ -2357,23 +2404,28 @@ def live_trading_all_us_stocks():
                         continue
                     last_price = df['Close'].iloc[-1]
 
+                pos_sizes = _bot_state.setdefault("position_sizes", {})
+                size = pos_sizes.get(epic, DEFAULT_SIZE)
+
                 if last_price >= tp:
-                    ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
-                    pnl = tp - entry_price
+                    ig.close_position(deal_id, "SELL", size)
+                    pnl = (tp - entry_price) * size
                     _bot_state["trade_log"].append(pnl)
-                    msg = f"✅ TP {epic} ({ticker}) {sig_type} PnL={pnl:.2f}"
+                    msg = f"✅ TP {epic} ({ticker}) x{size} {sig_type} PnL={pnl:.2f}"
                     tg_send(msg)
                     logging.info(msg)
                     del open_positions[epic]
+                    pos_sizes.pop(epic, None)
 
                 elif last_price <= sl:
-                    ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
-                    pnl = sl - entry_price
+                    ig.close_position(deal_id, "SELL", size)
+                    pnl = (sl - entry_price) * size
                     _bot_state["trade_log"].append(pnl)
-                    msg = f"❌ SL {epic} ({ticker}) {sig_type} PnL={pnl:.2f}"
+                    msg = f"❌ SL {epic} ({ticker}) x{size} {sig_type} PnL={pnl:.2f}"
                     tg_send(msg)
                     logging.info(msg)
                     del open_positions[epic]
+                    pos_sizes.pop(epic, None)
 
             time.sleep(60)
 
