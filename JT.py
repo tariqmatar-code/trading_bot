@@ -69,7 +69,7 @@ MENU = (
     "6 - Sell / Close position\n"
     "7 - Stop bot\n"
     "8 - Start bot\n"
-    "9 - Top losers + most active (Claude AI)\n"
+    "9 - Top losers + gainers + most active (Claude AI)\n"
     "10 - Check orders in place (IG)\n"
     "0 - Show this menu\n"
     "\n💡 Quick: type  buy  or  sell  to start guided order\n"
@@ -880,6 +880,37 @@ def _get_top_losers(n=10):
     return results
 
 
+def _get_top_gainers(n=10):
+    """Top gainers today from Yahoo Finance day_gainers screener."""
+    quotes = _yf_screener("day_gainers", n)
+    results = []
+    for q in quotes:
+        ticker = q.get("symbol", "")
+        pct    = float(q.get("regularMarketChangePercent", 0))
+        price  = float(q.get("regularMarketPrice", 0))
+        results.append((ticker, pct, price))
+    # fallback: compute from US_UNIVERSE if screener returned nothing
+    if not results:
+        raw = yf.download(US_UNIVERSE, period="2d", interval="1d", progress=False, group_by="ticker")
+        for ticker in US_UNIVERSE:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    closes = raw[ticker]["Close"].dropna()
+                else:
+                    closes = raw["Close"].dropna()
+                if len(closes) < 2:
+                    continue
+                prev_close  = float(closes.iloc[-2])
+                today_close = float(closes.iloc[-1])
+                pct = (today_close - prev_close) / prev_close * 100
+                results.append((ticker, pct, today_close))
+            except Exception:
+                continue
+        results.sort(key=lambda x: x[1], reverse=True)
+        results = results[:n]
+    return results
+
+
 def _get_most_active(n=10):
     """Most active stocks today from Yahoo Finance most_actives screener."""
     quotes = _yf_screener("most_actives", n)
@@ -935,7 +966,7 @@ def _ichimoku_summary(ticker: str):
 
 
 def analyze_top_losers():
-    """Fetch top losers + most active, run Ichimoku on each, ask Claude for entry recommendations."""
+    """Fetch top losers + gainers + most active, run Ichimoku on each, ask Claude for entry recommendations."""
     if not _ANTHROPIC_OK:
         tg_send("⚠️ anthropic package not installed. Run: pip install anthropic")
         return
@@ -943,7 +974,7 @@ def analyze_top_losers():
         tg_send("⚠️ CLAUDE_API_KEY not set in .env")
         return
 
-    tg_send("🔍 Fetching today's top losers & most active from Yahoo Finance...")
+    tg_send("🔍 Fetching today's top losers, gainers & most active from Yahoo Finance...")
 
     # ── Top losers ──────────────────────────────────────────
     try:
@@ -952,6 +983,13 @@ def analyze_top_losers():
         tg_send(f"⚠️ Failed to fetch top losers: {e}")
         losers = []
 
+    # ── Top gainers ─────────────────────────────────────────
+    try:
+        gainers = _get_top_gainers(10)
+    except Exception as e:
+        tg_send(f"⚠️ Failed to fetch top gainers: {e}")
+        gainers = []
+
     # ── Most active ─────────────────────────────────────────
     try:
         actives = _get_most_active(10)
@@ -959,7 +997,7 @@ def analyze_top_losers():
         tg_send(f"⚠️ Failed to fetch most active: {e}")
         actives = []
 
-    if not losers and not actives:
+    if not losers and not gainers and not actives:
         tg_send("No market data available today.")
         return
 
@@ -967,6 +1005,12 @@ def analyze_top_losers():
     if losers:
         lines = ["📉 Top 10 Losers today:"]
         for ticker, pct, price in losers:
+            lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
+        tg_send("\n".join(lines))
+
+    if gainers:
+        lines = ["📈 Top 10 Gainers today:"]
+        for ticker, pct, price in gainers:
             lines.append(f"  {ticker}: {pct:+.2f}% @ ${price:.2f}")
         tg_send("\n".join(lines))
 
@@ -993,6 +1037,17 @@ def analyze_top_losers():
             "TOP LOSERS:\n" + "\n".join(loser_lines)
         )
 
+    if gainers:
+        gainer_lines = []
+        for ticker, pct, price in gainers:
+            summary = _ichimoku_summary(ticker)
+            gainer_lines.append(
+                f"- {ticker}: {pct:+.2f}% change, price ${price:.2f}\n  Ichimoku: {summary}"
+            )
+        analysis_sections.append(
+            "TOP GAINERS:\n" + "\n".join(gainer_lines)
+        )
+
     if actives:
         active_lines = []
         for ticker, pct, price, vol in actives:
@@ -1009,10 +1064,10 @@ def analyze_top_losers():
         "You are an expert technical analyst using the Ichimoku + Fibonacci strategy.\n\n"
         "Here is today's market data with Ichimoku analysis:\n\n"
         + "\n\n".join(analysis_sections)
-        + "\n\nFor each ticker in BOTH lists:\n"
+        + "\n\nFor each ticker in ALL lists:\n"
         "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fib)\n"
         "2. If yes, give entry zone, take-profit, and stop-loss levels.\n"
-        "3. At the end, rank the TOP 3 best trade opportunities across both lists by risk/reward.\n\n"
+        "3. At the end, rank the TOP 3 best trade opportunities across all lists by risk/reward.\n\n"
         "Be concise. Format for Telegram (max 4000 chars).\n\n"
         "IMPORTANT: After your analysis, append a JSON code block with the top picks for AUTO-BUY. "
         "Include ONLY tickers with a clean long setup (above cloud, TK bullish, at Fib entry zone). "
