@@ -28,6 +28,12 @@ IG_PASSWORD    = os.getenv("IG_PASSWORD")
 IG_ACCOUNT_ID  = os.getenv("IG_ACCOUNT_ID", "")
 IG_DEMO        = os.getenv("IG_ACCOUNT_TYPE", "DEMO").upper() == "DEMO"
 
+# Broker selector — IG (default, legacy) or ALPACA
+BROKER            = os.getenv("BROKER", "IG").upper()
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER      = os.getenv("ALPACA_PAPER", "TRUE").upper() == "TRUE"
+
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
@@ -823,6 +829,192 @@ class IGClient:
         headers = {"_method": "DELETE"}
         return self._request("POST", url, headers=headers).json()
 
+    def get_account(self):
+        """Return account info in unified shape (used by send_account_report)."""
+        r = self._request("GET", f"{self.base}/accounts")
+        accounts = r.json().get("accounts", [])
+        acc = next((a for a in accounts if a.get("preferred")), accounts[0] if accounts else {})
+        bal = acc.get("balance", {})
+        return {
+            "balance":   bal.get("balance", "N/A"),
+            "available": bal.get("available", "N/A"),
+            "deposit":   bal.get("deposit", "N/A"),
+            "currency":  acc.get("currency", ""),
+            "pnl":       bal.get("profitLoss", "N/A"),
+        }
+
+
+# ================== ALPACA CLIENT ==================
+class AlpacaClient:
+    """
+    Drop-in replacement for IGClient. Uses alpaca-py SDK for orders/positions
+    and yfinance for historical bars (per user choice).
+
+    Returns data shaped to match IGClient's responses so the rest of the bot
+    (scan_all_markets, send_orders_report, etc.) works unchanged.
+    """
+
+    def __init__(self, api_key, secret, paper=True):
+        if not api_key or not secret:
+            raise Exception("Alpaca API key/secret missing in .env (ALPACA_API_KEY, ALPACA_SECRET_KEY)")
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import (
+            MarketOrderRequest, GetOrdersRequest, ClosePositionRequest,
+        )
+        from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+        self._OrderSide = OrderSide
+        self._TimeInForce = TimeInForce
+        self._QueryOrderStatus = QueryOrderStatus
+        self._MarketOrderRequest = MarketOrderRequest
+        self._GetOrdersRequest = GetOrdersRequest
+        self._ClosePositionRequest = ClosePositionRequest
+        self.client = TradingClient(api_key, secret, paper=paper)
+        self.paper = paper
+        self.base = "paper" if paper else "live"
+
+    def prices(self, epic, resolution="H1", num=200):
+        """Fetch bars via yfinance, return in IG-compatible nested-dict shape."""
+        interval_map = {"H1": "60m", "D1": "1d", "M15": "15m", "M5": "5m", "M1": "1m"}
+        period_map   = {"H1": "60d", "D1": "2y", "M15": "30d", "M5": "15d", "M1": "7d"}
+        interval = interval_map.get(resolution, "60m")
+        period   = period_map.get(resolution, "60d")
+        try:
+            df = yf.download(epic, period=period, interval=interval, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.tail(num)
+            prices = []
+            for ts, row in df.iterrows():
+                o = float(row["Open"]); h = float(row["High"])
+                l = float(row["Low"]);  c = float(row["Close"])
+                v = int(row.get("Volume", 0) or 0)
+                prices.append({
+                    "snapshotTime": ts.strftime("%Y/%m/%d %H:%M:%S"),
+                    "openPrice":   {"bid": o},
+                    "highPrice":   {"bid": h},
+                    "lowPrice":    {"bid": l},
+                    "closePrice":  {"bid": c},
+                    "lastTradedVolume": v,
+                })
+            return {"prices": prices}
+        except Exception as e:
+            logging.error(f"Alpaca/yfinance price fetch for {epic}: {e}")
+            return {"prices": []}
+
+    def search_markets(self, search_term):
+        """Alpaca trades symbols directly — return synthetic 'market' record."""
+        try:
+            asset = self.client.get_asset(search_term)
+            return {"markets": [{
+                "epic": asset.symbol,
+                "instrumentName": getattr(asset, "name", None) or asset.symbol,
+            }]}
+        except Exception:
+            return {"markets": []}
+
+    def place_order(self, epic, direction, size):
+        """epic == symbol for Alpaca. direction = 'BUY' or 'SELL'."""
+        side = self._OrderSide.BUY if direction.upper() == "BUY" else self._OrderSide.SELL
+        req = self._MarketOrderRequest(
+            symbol=epic,
+            qty=size,
+            side=side,
+            time_in_force=self._TimeInForce.DAY,
+        )
+        order = self.client.submit_order(req)
+        return {"dealReference": str(order.id), "dealId": str(order.id)}
+
+    def close_position(self, deal_id, direction, size):
+        """For Alpaca, deal_id is the symbol (mapped that way in get_positions)."""
+        try:
+            self.client.close_position(
+                deal_id,
+                close_options=self._ClosePositionRequest(qty=str(size)),
+            )
+            return {"dealReference": deal_id}
+        except Exception as e:
+            raise Exception(f"Alpaca close failed: {e}")
+
+    def get_positions(self):
+        """Return positions shaped like IG's get_positions response."""
+        positions = self.client.get_all_positions()
+        out = []
+        for p in positions:
+            qty = float(p.qty)
+            avg = float(p.avg_entry_price)
+            upl = float(p.unrealized_pl)
+            current = float(p.current_price) if getattr(p, "current_price", None) else 0
+            out.append({
+                "position": {
+                    "dealId": p.symbol,
+                    "direction": "BUY" if qty > 0 else "SELL",
+                    "size": abs(qty),
+                    "openLevel": avg,
+                    "level": avg,
+                    "upl": upl,
+                },
+                "market": {
+                    "epic": p.symbol,
+                    "instrumentName": p.symbol,
+                    "bid": current,
+                },
+            })
+        return out
+
+    def get_working_orders(self):
+        """Open (pending) Alpaca orders in IG-compatible shape."""
+        req = self._GetOrdersRequest(status=self._QueryOrderStatus.OPEN)
+        orders = self.client.get_orders(filter=req)
+        out = []
+        for o in orders:
+            qty   = float(o.qty) if o.qty else 0
+            lvl   = float(o.limit_price) if getattr(o, "limit_price", None) else 0
+            otype = (o.order_type.value if hasattr(o.order_type, "value") else str(o.order_type)).upper()
+            side  = (o.side.value if hasattr(o.side, "value") else str(o.side)).upper()
+            entry = {
+                "workingOrderData": {
+                    "dealId": str(o.id),
+                    "epic": o.symbol,
+                    "direction": side,
+                    "orderSize": qty,
+                    "orderLevel": lvl,
+                    "orderType": otype,
+                },
+                "marketData": {
+                    "instrumentName": o.symbol,
+                    "epic": o.symbol,
+                },
+                "workingOrder": {
+                    "dealId": str(o.id),
+                    "direction": side,
+                    "size": qty,
+                    "orderType": otype,
+                    "level": lvl,
+                },
+                "market": {
+                    "instrumentName": o.symbol,
+                    "epic": o.symbol,
+                },
+            }
+            out.append(entry)
+        return out
+
+    def delete_working_order(self, deal_id):
+        self.client.cancel_order_by_id(deal_id)
+        return {"dealReference": deal_id}
+
+    def get_account(self):
+        """Return Alpaca account info shaped like IGClient.get_account()."""
+        acc = self.client.get_account()
+        return {
+            "balance":   float(acc.equity),
+            "available": float(acc.buying_power),
+            "deposit":   float(acc.cash),
+            "currency":  acc.currency,
+            "pnl":       float(acc.equity) - float(acc.last_equity),
+        }
+
+
 # ================== IG HELPERS ==================
 def ig_prices_to_df(data):
     prices = data.get("prices", [])
@@ -841,9 +1033,12 @@ def ig_prices_to_df(data):
     df.set_index("timestamp", inplace=True)
     return df
 
-def get_epic(ig: IGClient, ticker: str):
+def get_epic(broker, ticker: str):
+    # Alpaca trades symbols directly — no EPIC concept.
+    if isinstance(broker, AlpacaClient):
+        return ticker
     try:
-        data = ig.search_markets(ticker)
+        data = broker.search_markets(ticker)
         markets = data.get("markets", [])
         if not markets:
             return None
@@ -865,7 +1060,13 @@ def load_us_stock_universe():
 
 EPIC_CACHE_FILE = "epic_cache.json"
 
-def build_epic_universe(ig: IGClient):
+def build_epic_universe(broker):
+    # Alpaca: skip EPIC lookup entirely — symbol IS the identifier.
+    if isinstance(broker, AlpacaClient):
+        mapping = [(t, t) for t in load_us_stock_universe()]
+        tg_send(f"Alpaca: tracking {len(mapping)} symbols directly (no EPIC lookup)")
+        return mapping
+
     if os.path.exists(EPIC_CACHE_FILE):
         with open(EPIC_CACHE_FILE) as f:
             mapping = json.load(f)
@@ -876,7 +1077,7 @@ def build_epic_universe(ig: IGClient):
     tickers = load_us_stock_universe()
     mapping = []
     for i, t in enumerate(tickers):
-        epic = get_epic(ig, t)
+        epic = get_epic(broker, t)
         if epic:
             mapping.append((t, epic))
         if i % 50 == 0:
@@ -1149,23 +1350,21 @@ def send_orders_report(ig: IGClient):
 
 
 # ================== ACCOUNT REPORT ==================
-def send_account_report(ig: IGClient):
+def send_account_report(broker):
+    """Broker-agnostic account snapshot. Works with IGClient or AlpacaClient."""
     try:
-        r = ig._request("GET", f"{ig.base}/accounts")
-        accounts = r.json().get("accounts", [])
-        acc = next((a for a in accounts if a.get("preferred")), accounts[0] if accounts else {})
-        balance    = acc.get("balance", {}).get("balance", "N/A")
-        deposit    = acc.get("balance", {}).get("deposit", "N/A")
-        pnl        = acc.get("balance", {}).get("profitLoss", "N/A")
-        available  = acc.get("balance", {}).get("available", "N/A")
-        currency   = acc.get("currency", "")
+        acc = broker.get_account()
+        balance   = acc.get("balance", "N/A")
+        available = acc.get("available", "N/A")
+        deposit   = acc.get("deposit", "N/A")
+        pnl       = acc.get("pnl", "N/A")
+        currency  = acc.get("currency", "")
     except Exception as e:
         tg_send(f"⚠️ Could not fetch account info: {e}")
         return
 
     try:
-        r2 = ig._request("GET", f"{ig.base}/positions")
-        positions = r2.json().get("positions", [])
+        positions = broker.get_positions()
         pos_lines = []
         for p in positions:
             pos = p.get("position", {})
@@ -1179,7 +1378,7 @@ def send_account_report(ig: IGClient):
         pos_text = "  Could not fetch positions"
 
     msg = (
-        f"📊 Account Report\n"
+        f"📊 Account Report ({BROKER})\n"
         f"Balance:   {balance} {currency}\n"
         f"Available: {available} {currency}\n"
         f"Deposit:   {deposit} {currency}\n"
@@ -1597,15 +1796,18 @@ def _analyze_single_ticker(ticker):
         tg_send(f"❌ Analysis failed: {e}")
 
 
-def _refresh_epic_cache(ig):
-    """Cmd 21: delete epic_cache.json and rebuild from US_UNIVERSE."""
+def _refresh_epic_cache(broker):
+    """Cmd 21: delete epic_cache.json and rebuild. No-op on Alpaca (no EPICs)."""
+    if isinstance(broker, AlpacaClient):
+        tg_send("ℹ️ Alpaca uses symbols directly — no EPIC cache to refresh.")
+        return
     tg_send(f"🔄 Refreshing EPIC cache for {len(US_UNIVERSE)} tickers (~30s)...")
     try:
         if os.path.exists(EPIC_CACHE_FILE):
             os.remove(EPIC_CACHE_FILE)
         mapping = []
         for t in US_UNIVERSE:
-            epic = get_epic(ig, t)
+            epic = get_epic(broker, t)
             if epic:
                 mapping.append((t, epic))
             time.sleep(0.5)
@@ -1985,14 +2187,19 @@ def analyze_top_losers():
 
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
 def live_trading_all_us_stocks():
-    ig = IGClient(IG_API_KEY, IG_IDENTIFIER, IG_PASSWORD, IG_ACCOUNT_ID, demo=IG_DEMO)
+    if BROKER == "ALPACA":
+        ig = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+        broker_label = f"Alpaca ({'paper' if ALPACA_PAPER else 'LIVE'})"
+    else:
+        ig = IGClient(IG_API_KEY, IG_IDENTIFIER, IG_PASSWORD, IG_ACCOUNT_ID, demo=IG_DEMO)
+        broker_label = f"IG ({'demo' if IG_DEMO else 'LIVE'})"
     _bot_state["ig"] = ig
     _bot_state["start_time"] = time.time()
 
     threading.Thread(target=tg_listener, daemon=True).start()
     threading.Thread(target=_watch_list_loop, daemon=True).start()
 
-    tg_send("🤖 IG Bot Started (Top 30 US Stocks)")
+    tg_send(f"🤖 Bot Started — broker: {broker_label} (Top 30 US Stocks)")
     tg_send(MENU)
 
     mapping = build_epic_universe(ig)  # list of (ticker, epic)
