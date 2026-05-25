@@ -71,6 +71,14 @@ MENU = (
     "8 - Start bot\n"
     "9 - Top losers + gainers + most active (Claude AI)\n"
     "10 - Check orders in place (IG)\n"
+    "11 - Crypto scan (Claude AI)\n"
+    "12 - Pre-market scan\n"
+    "13 - Backtest a ticker\n"
+    "14 - Recent trade log\n"
+    "15 - Cancel a pending IG order\n"
+    "16 - Set position size (DEFAULT_SIZE)\n"
+    "17 - Force-close ALL open positions\n"
+    "18 - Auto-buy history\n"
     "0 - Show this menu\n"
     "\n💡 Quick: type  buy  or  sell  to start guided order\n"
     "   Or direct: BUY AAPL 1 / SELL TSLA 2"
@@ -81,6 +89,7 @@ _bot_state = {
     "ig": None,
     "open_positions": {},
     "trade_log": [],
+    "auto_buy_log": [],
     "start_time": time.time(),
     "last_scan": None,
     "running": True,
@@ -89,6 +98,9 @@ _bot_state = {
     "awaiting_close": None,     # list of open positions waiting for number
     "awaiting_trade": None,          # guided buy/sell: {step, direction, ticker, size}
     "awaiting_close_confirm": None,  # pending close waiting for y/n
+    "awaiting_backtest": False,      # waiting for ticker symbol
+    "awaiting_cancel_order": None,   # list of working orders waiting for number
+    "awaiting_set_size": False,      # waiting for new DEFAULT_SIZE value
 }
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
@@ -111,6 +123,7 @@ def _execute_order(ig, direction: str, ticker: str, size: float):
 
 
 def tg_handle_command(text: str):
+    global DEFAULT_SIZE
     cmd = text.strip()
     ig  = _bot_state.get("ig")
 
@@ -238,6 +251,61 @@ def tg_handle_command(text: str):
                 tg_send("❌ Order cancelled.")
             return
 
+    # ── Backtest: ticker prompt ───────────────────────────
+    if _bot_state.get("awaiting_backtest"):
+        _bot_state["awaiting_backtest"] = False
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        ticker = cmd.upper().strip()
+        threading.Thread(target=_run_backtest, args=(ticker,), daemon=True).start()
+        return
+
+    # ── Cancel order: select from pending ─────────────────
+    if _bot_state.get("awaiting_cancel_order") is not None:
+        orders = _bot_state["awaiting_cancel_order"]
+        _bot_state["awaiting_cancel_order"] = None
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        try:
+            idx = int(cmd) - 1
+            if idx < 0 or idx >= len(orders):
+                raise ValueError
+        except ValueError:
+            tg_send("Invalid selection. Cancelled.")
+            return
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        deal_id = orders[idx].get("workingOrderData", {}).get("dealId")
+        if not deal_id:
+            tg_send("⚠️ Missing deal ID.")
+            return
+        try:
+            ig.delete_working_order(deal_id)
+            tg_send(f"✅ Cancelled order {deal_id}")
+        except Exception as e:
+            tg_send(f"❌ Cancel failed: {e}")
+        return
+
+    # ── Set DEFAULT_SIZE ──────────────────────────────────
+    if _bot_state.get("awaiting_set_size"):
+        _bot_state["awaiting_set_size"] = False
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        try:
+            new_size = float(cmd.replace(",", "."))
+            if new_size <= 0:
+                raise ValueError
+        except ValueError:
+            tg_send("Invalid size. Cancelled.")
+            return
+        DEFAULT_SIZE = new_size
+        tg_send(f"✅ DEFAULT_SIZE set to {DEFAULT_SIZE}")
+        return
+
     # ── Direct trade: BUY TSLA / BUY TSLA 2 / SELL MSFT ──
     parts = cmd.upper().split()
     if len(parts) >= 2 and parts[0] in ("BUY", "SELL"):
@@ -351,6 +419,83 @@ def tg_handle_command(text: str):
         else:
             tg_send("⚠️ Bot not connected yet.")
 
+    elif cmd == "11":
+        threading.Thread(target=analyze_crypto, daemon=True).start()
+
+    elif cmd == "12":
+        threading.Thread(target=run_premarket_scan_once, daemon=True).start()
+
+    elif cmd == "13":
+        _bot_state["awaiting_backtest"] = True
+        tg_send("📊 Backtest — which ticker?\nType the symbol (e.g. AAPL, TSLA) or n to cancel")
+
+    elif cmd == "14":
+        trades = _bot_state.get("trade_log", [])
+        if not trades:
+            tg_send("No trades yet.")
+        else:
+            recent = trades[-10:]
+            lines = [f"📒 Recent Trade Log (last {len(recent)} of {len(trades)}):"]
+            for i, pnl in enumerate(recent, 1):
+                marker = "🟢" if pnl > 0 else "🔴"
+                lines.append(f"  {i}. {marker} {pnl:+.2f}")
+            lines.append(f"\nTotal P&L: {sum(trades):+.2f}")
+            tg_send("\n".join(lines))
+
+    elif cmd == "15":
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        try:
+            orders = ig.get_working_orders()
+        except Exception as e:
+            tg_send(f"⚠️ Failed to fetch working orders: {e}")
+            return
+        if not orders:
+            tg_send("No pending orders.")
+            return
+        lines = ["📋 Pending orders — reply with number to cancel:"]
+        for i, o in enumerate(orders, 1):
+            wo = o.get("workingOrderData", {})
+            md = o.get("marketData", {})
+            epic = wo.get("epic", "?")
+            direction = wo.get("direction", "?")
+            size = wo.get("orderSize", "?")
+            level = wo.get("orderLevel", "?")
+            name = md.get("instrumentName", epic)
+            lines.append(f"  {i}. {direction} {name} x{size} @ {level}")
+        lines.append("\nReply n to cancel")
+        _bot_state["awaiting_cancel_order"] = orders
+        tg_send("\n".join(lines))
+
+    elif cmd == "16":
+        _bot_state["awaiting_set_size"] = True
+        tg_send(f"Current DEFAULT_SIZE: {DEFAULT_SIZE}\nReply with new size (e.g. 1, 0.5, 2) or n to cancel")
+
+    elif cmd == "17":
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        pos = _bot_state.get("open_positions", {})
+        if not pos:
+            tg_send("No open positions to close.")
+            return
+        threading.Thread(target=_force_close_all, args=(ig,), daemon=True).start()
+
+    elif cmd == "18":
+        log_entries = _bot_state.get("auto_buy_log", [])
+        if not log_entries:
+            tg_send("No auto-buys yet.")
+        else:
+            recent = log_entries[-15:]
+            lines = [f"🤖 Auto-Buy History (last {len(recent)} of {len(log_entries)}):"]
+            for e in recent:
+                lines.append(
+                    f"  {e['time']} {e['ticker']}  "
+                    f"entry ${e['entry']:.2f}  TP ${e['tp']:.2f}  SL ${e['sl']:.2f}"
+                )
+            tg_send("\n".join(lines))
+
     else:
         tg_send(MENU)
 
@@ -458,6 +603,12 @@ class IGClient:
     def get_working_orders(self):
         """Return all pending (working) orders from IG."""
         return self._request("GET", f"{self.base}/workingorders").json().get("workingOrders", [])
+
+    def delete_working_order(self, deal_id):
+        """Cancel a pending (working) IG order."""
+        url = f"{self.base}/workingorders/otc/{deal_id}"
+        headers = {"_method": "DELETE"}
+        return self._request("POST", url, headers=headers).json()
 
 # ================== IG HELPERS ==================
 def ig_prices_to_df(data):
@@ -965,6 +1116,216 @@ def _ichimoku_summary(ticker: str):
         return f"error: {e}"
 
 
+CRYPTO_UNIVERSE = [
+    "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "ADA-USD",
+    "SOL-USD", "DOGE-USD", "DOT-USD", "AVAX-USD", "MATIC-USD",
+    "LINK-USD", "LTC-USD", "ATOM-USD", "UNI-USD", "ETC-USD",
+]
+
+
+def _get_crypto_movers(n=10):
+    """Top crypto gainers and losers from 24h change over CRYPTO_UNIVERSE."""
+    raw = yf.download(CRYPTO_UNIVERSE, period="2d", interval="1d", progress=False, group_by="ticker")
+    results = []
+    for sym in CRYPTO_UNIVERSE:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                closes = raw[sym]["Close"].dropna()
+            else:
+                closes = raw["Close"].dropna()
+            if len(closes) < 2:
+                continue
+            prev_close  = float(closes.iloc[-2])
+            today_close = float(closes.iloc[-1])
+            pct = (today_close - prev_close) / prev_close * 100
+            results.append((sym, pct, today_close))
+        except Exception:
+            continue
+    gainers = sorted(results, key=lambda x: x[1], reverse=True)[:n]
+    losers  = sorted(results, key=lambda x: x[1])[:n]
+    return gainers, losers
+
+
+def _fmt_price(p):
+    return f"${p:.4f}" if p < 1 else f"${p:.2f}"
+
+
+def analyze_crypto():
+    """Read-only Claude crypto scan over CRYPTO_UNIVERSE — no auto-buy."""
+    if not _ANTHROPIC_OK:
+        tg_send("⚠️ anthropic package not installed.")
+        return
+    if not CLAUDE_API_KEY:
+        tg_send("⚠️ CLAUDE_API_KEY not set in .env")
+        return
+
+    tg_send("🔍 Fetching crypto 24h movers...")
+    try:
+        gainers, losers = _get_crypto_movers(10)
+    except Exception as e:
+        tg_send(f"⚠️ Failed to fetch crypto data: {e}")
+        return
+
+    if not gainers and not losers:
+        tg_send("No crypto data available.")
+        return
+
+    if gainers:
+        lines = ["📈 Top Crypto Gainers (24h):"]
+        for sym, pct, price in gainers:
+            lines.append(f"  {sym}: {pct:+.2f}% @ {_fmt_price(price)}")
+        tg_send("\n".join(lines))
+    if losers:
+        lines = ["📉 Top Crypto Losers (24h):"]
+        for sym, pct, price in losers:
+            lines.append(f"  {sym}: {pct:+.2f}% @ {_fmt_price(price)}")
+        tg_send("\n".join(lines))
+
+    tg_send("🤖 Running Ichimoku analysis & asking Claude...")
+
+    analysis_sections = []
+    for label, group in (("CRYPTO GAINERS", gainers), ("CRYPTO LOSERS", losers)):
+        if not group:
+            continue
+        section_lines = []
+        for sym, pct, price in group:
+            summary = _ichimoku_summary(sym)
+            section_lines.append(
+                f"- {sym}: {pct:+.2f}% change, price {_fmt_price(price)}\n  Ichimoku: {summary}"
+            )
+        analysis_sections.append(f"{label}:\n" + "\n".join(section_lines))
+
+    prompt = (
+        "You are an expert crypto technical analyst using the Ichimoku + Fibonacci strategy.\n\n"
+        "Here is today's crypto data with Ichimoku analysis:\n\n"
+        + "\n\n".join(analysis_sections)
+        + "\n\nFor each crypto in BOTH lists:\n"
+        "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fib)\n"
+        "2. If yes, give entry zone, take-profit, and stop-loss levels.\n"
+        "3. Rank the TOP 3 best trade opportunities across both lists by risk/reward.\n\n"
+        "Be concise. Format for Telegram (max 4000 chars)."
+    )
+
+    try:
+        client = _anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        with client.messages.stream(
+            model="claude-opus-4-7",
+            max_tokens=2000,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            msg = stream.get_final_message()
+        reply = "".join(b.text for b in msg.content if b.type == "text")
+        if reply:
+            tg_send(f"🧠 Claude (Crypto):\n{reply[:4000]}")
+        else:
+            tg_send("Claude returned no text response.")
+    except Exception as e:
+        tg_send(f"⚠️ Claude API error: {e}")
+
+
+def run_premarket_scan_once():
+    """One-shot pre-market scan over US_UNIVERSE (4:00–9:30 AM ET window)."""
+    try:
+        import pytz
+    except ImportError:
+        tg_send("⚠️ pytz not installed. Run: pip install pytz")
+        return
+    from datetime import datetime as _dt
+    ET = pytz.timezone("America/New_York")
+    now_et = _dt.now(ET)
+    hm = (now_et.hour, now_et.minute)
+    if not ((4, 0) <= hm < (9, 30)):
+        tg_send(
+            f"⚠️ Outside pre-market window ({now_et.strftime('%I:%M %p ET')}).\n"
+            f"Pre-market runs 4:00–9:30 AM ET."
+        )
+        return
+
+    tg_send(f"🌅 Pre-market scan on {len(US_UNIVERSE)} tickers...")
+    signals = []
+    today = now_et.date()
+    for sym in US_UNIVERSE:
+        try:
+            df = yf.download(sym, period="2d", interval="1m", prepost=True, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.index = df.index.tz_convert(ET)
+            df = df[df.index.date == today].between_time("04:00", "09:29")
+            if len(df) < 10:
+                continue
+            green = int((df["Close"] > df["Open"]).sum())
+            pct_green = green / len(df) * 100
+            if pct_green < 60:
+                continue
+            daily = yf.download(sym, period="5d", interval="1d", progress=False)
+            if daily.empty or len(daily) < 2:
+                continue
+            if isinstance(daily.columns, pd.MultiIndex):
+                daily.columns = daily.columns.get_level_values(0)
+            prev_close = float(daily["Close"].iloc[-2])
+            last_price = float(df["Close"].iloc[-1])
+            if prev_close <= 0:
+                continue
+            pct_change = (last_price / prev_close - 1) * 100
+            if pct_change <= 0:
+                continue
+            signals.append((sym, pct_change, pct_green, last_price))
+        except Exception:
+            continue
+
+    signals.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    if not signals:
+        tg_send("🌅 Pre-market: no stocks with 60%+ bullish candles.")
+        return
+    lines = [f"🌅 Pre-market — {len(signals)} bullish stocks:"]
+    for sym, pc, pg, price in signals[:15]:
+        lines.append(f"  {sym}: +{pc:.2f}% @ ${price:.2f}  ({pg:.0f}% green)")
+    tg_send("\n".join(lines))
+
+
+def _force_close_all(ig):
+    """Close every open position at market. No confirmation."""
+    pos = _bot_state.get("open_positions", {})
+    total = len(pos)
+    if total == 0:
+        tg_send("No open positions to close.")
+        return
+    tg_send(f"🚨 Force-closing {total} positions...")
+    closed = 0
+    for epic, data in list(pos.items()):
+        deal_id, entry, tp, sl, sig, ticker = data
+        try:
+            ig.close_position(deal_id, "SELL", DEFAULT_SIZE)
+            sell_price = get_realtime_price(ticker) or entry
+            pnl = sell_price - entry
+            _bot_state["trade_log"].append(pnl)
+            pos.pop(epic, None)
+            tg_send(f"✅ Closed {ticker} ({sig}) P&L: {pnl:+.2f}")
+            closed += 1
+        except Exception as e:
+            tg_send(f"❌ Close {ticker} failed: {e}")
+    tg_send(f"Done. Closed {closed}/{total} positions.")
+
+
+def _run_backtest(ticker):
+    """Run a 3-year daily backtest for a single ticker; send summary to Telegram."""
+    tg_send(f"📊 Running 3y backtest for {ticker}...")
+    try:
+        df = yf.download(ticker, period="3y", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty:
+            tg_send(f"⚠️ No data for {ticker}.")
+            return
+        _, _, summary = backtest(df, plot=False)
+        tg_send(f"📊 Backtest {ticker}\n{summary}")
+    except Exception as e:
+        tg_send(f"❌ Backtest failed: {e}")
+
+
 def analyze_top_losers():
     """Fetch top losers + gainers + most active, run Ichimoku on each, ask Claude for entry recommendations."""
     if not _ANTHROPIC_OK:
@@ -1150,6 +1511,14 @@ def analyze_top_losers():
             res = ig.place_order(epic, "BUY", DEFAULT_SIZE)
             deal_ref = res.get("dealReference", "N/A")
             open_positions[epic] = (deal_ref, entry, tp, sl, "AUTO-BUY", ticker)
+            _bot_state.setdefault("auto_buy_log", []).append({
+                "time": time.strftime("%Y-%m-%d %H:%M"),
+                "ticker": ticker,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "deal_ref": deal_ref,
+            })
             tg_send(
                 f"🤖 AUTO-BUY {ticker} x{DEFAULT_SIZE}\n"
                 f"📥 Entry: ${entry:.2f}\n"
