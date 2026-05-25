@@ -94,12 +94,12 @@ MENU = (
     "7 - Stop bot\n"
     "8 - Start bot\n"
     "9 - Top losers + gainers + most active (Claude AI)\n"
-    "10 - Check orders in place (IG)\n"
+    f"10 - Check orders in place ({BROKER})\n"
     "11 - Crypto scan (Claude AI)\n"
     "12 - Pre-market scan\n"
     "13 - Backtest a ticker\n"
     "14 - Recent trade log\n"
-    "15 - Cancel a pending IG order\n"
+    f"15 - Cancel a pending {BROKER} order\n"
     "16 - Set position size (DEFAULT_SIZE)\n"
     "17 - Force-close ALL open positions\n"
     "18 - Auto-buy history\n"
@@ -2133,7 +2133,7 @@ def analyze_top_losers():
 
     ig = _bot_state.get("ig")
     if not ig:
-        tg_send("⚠️ Auto-buy skipped: IG not connected.")
+        tg_send(f"⚠️ Auto-buy skipped: {BROKER} not connected.")
         return
 
     open_positions = _bot_state.setdefault("open_positions", {})
@@ -2152,7 +2152,7 @@ def analyze_top_losers():
 
         epic = get_epic(ig, ticker)
         if not epic:
-            tg_send(f"⚠️ Skip {ticker}: no IG EPIC available.")
+            tg_send(f"⚠️ Skip {ticker}: symbol not available on {BROKER}.")
             continue
         if epic in open_positions:
             tg_send(f"⚠️ Skip {ticker}: already have an open position.")
