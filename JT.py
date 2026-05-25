@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import json
 import time
 import logging
@@ -1012,30 +1013,101 @@ def analyze_top_losers():
         "1. Is there a valid long entry setup? (price above cloud, TK bullish, near 38.2% or 61.8% Fib)\n"
         "2. If yes, give entry zone, take-profit, and stop-loss levels.\n"
         "3. At the end, rank the TOP 3 best trade opportunities across both lists by risk/reward.\n\n"
-        "Be concise. Format for Telegram (max 4000 chars)."
+        "Be concise. Format for Telegram (max 4000 chars).\n\n"
+        "IMPORTANT: After your analysis, append a JSON code block with the top picks for AUTO-BUY. "
+        "Include ONLY tickers with a clean long setup (above cloud, TK bullish, at Fib entry zone). "
+        "Use an empty array if no picks qualify. Use plain numbers (no $ signs, no commas):\n\n"
+        "```json\n"
+        "{\"top_picks\": [\n"
+        "  {\"ticker\": \"AAPL\", \"entry\": 195.50, \"tp\": 210.00, \"sl\": 188.00}\n"
+        "]}\n"
+        "```"
     )
 
+    reply = ""
     try:
         client = _anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         with client.messages.stream(
             model="claude-opus-4-7",
-            max_tokens=1800,
+            max_tokens=2500,
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
             msg = stream.get_final_message()
 
-        reply = ""
         for block in msg.content:
             if block.type == "text":
                 reply += block.text
-
-        if reply:
-            tg_send(f"🧠 Claude Analysis:\n{reply[:4000]}")
-        else:
-            tg_send("Claude returned no text response.")
     except Exception as e:
         tg_send(f"⚠️ Claude API error: {e}")
+        return
+
+    if not reply:
+        tg_send("Claude returned no text response.")
+        return
+
+    # ── Parse top picks JSON ─────────────────────────────────
+    top_picks = []
+    json_match = re.search(r"```json\s*(\{.*?\})\s*```", reply, re.DOTALL)
+    if json_match:
+        try:
+            top_picks = json.loads(json_match.group(1)).get("top_picks", []) or []
+        except json.JSONDecodeError as e:
+            logging.error(f"Top picks JSON parse failed: {e}")
+
+    # Strip JSON block from human-readable analysis
+    display_reply = re.sub(r"```json.*?```", "", reply, flags=re.DOTALL).strip()
+    tg_send(f"🧠 Claude Analysis:\n{display_reply[:4000]}")
+
+    # ── Auto-buy Claude's top picks ──────────────────────────
+    if not top_picks:
+        tg_send("ℹ️ No auto-buy: Claude found no qualifying setups.")
+        return
+
+    ig = _bot_state.get("ig")
+    if not ig:
+        tg_send("⚠️ Auto-buy skipped: IG not connected.")
+        return
+
+    open_positions = _bot_state.setdefault("open_positions", {})
+    placed = 0
+    for pick in top_picks[:3]:
+        try:
+            ticker = str(pick.get("ticker", "")).upper().strip()
+            entry  = float(pick["entry"])
+            tp     = float(pick["tp"])
+            sl     = float(pick["sl"])
+        except (KeyError, TypeError, ValueError):
+            tg_send(f"⚠️ Skip malformed pick: {pick}")
+            continue
+        if not ticker:
+            continue
+
+        epic = get_epic(ig, ticker)
+        if not epic:
+            tg_send(f"⚠️ Skip {ticker}: no IG EPIC available.")
+            continue
+        if epic in open_positions:
+            tg_send(f"⚠️ Skip {ticker}: already have an open position.")
+            continue
+
+        try:
+            res = ig.place_order(epic, "BUY", DEFAULT_SIZE)
+            deal_ref = res.get("dealReference", "N/A")
+            open_positions[epic] = (deal_ref, entry, tp, sl, "AUTO-BUY", ticker)
+            tg_send(
+                f"🤖 AUTO-BUY {ticker} x{DEFAULT_SIZE}\n"
+                f"📥 Entry: ${entry:.2f}\n"
+                f"🎯 TP:    ${tp:.2f}\n"
+                f"🛑 SL:    ${sl:.2f}\n"
+                f"Ref: {deal_ref}"
+            )
+            placed += 1
+        except Exception as e:
+            tg_send(f"❌ Auto-buy {ticker} failed: {e}")
+
+    if placed == 0:
+        tg_send("ℹ️ No auto-buys placed (all picks skipped).")
 
 
 # ================== LIVE BOT (YAHOO PRICE FOR ENTRY & EXIT) ==================
