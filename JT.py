@@ -59,6 +59,24 @@ def tg_send(msg: str):
 def tg_report(summary: str):
     tg_send("📊 REPORT\n" + summary)
 
+def tg_send_document(file_path: str, caption: str = ""):
+    """Upload a file to Telegram via sendDocument."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured (document):", file_path)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        with open(file_path, "rb") as f:
+            requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"document": f},
+                timeout=30,
+            )
+    except Exception as e:
+        print("Telegram document error:", e)
+        tg_send(f"⚠️ Failed to send file: {e}")
+
 MENU = (
     "📋 Menu — reply with a number:\n"
     "1 - Account report\n"
@@ -79,6 +97,16 @@ MENU = (
     "16 - Set position size (DEFAULT_SIZE)\n"
     "17 - Force-close ALL open positions\n"
     "18 - Auto-buy history\n"
+    "19 - Live price check\n"
+    "20 - Single-ticker Claude analysis\n"
+    "21 - Refresh EPIC cache\n"
+    "22 - Modify SL/TP of an open position\n"
+    "23 - Sector scan (S&P sector ETFs)\n"
+    "24 - News for a ticker\n"
+    "25 - Toggle auto-buy on/off\n"
+    "26 - Export trade log to CSV\n"
+    "27 - Risk dashboard\n"
+    "28 - Watch list / price alerts\n"
     "0 - Show this menu\n"
     "\n💡 Quick: type  buy  or  sell  to start guided order\n"
     "   Or direct: BUY AAPL 1 / SELL TSLA 2"
@@ -101,6 +129,13 @@ _bot_state = {
     "awaiting_backtest": False,      # waiting for ticker symbol
     "awaiting_cancel_order": None,   # list of working orders waiting for number
     "awaiting_set_size": False,      # waiting for new DEFAULT_SIZE value
+    "awaiting_price_check": False,
+    "awaiting_claude_ticker": False,
+    "awaiting_news_ticker": False,
+    "awaiting_modify_sltp": None,    # {step, pos_list, epic, sl, tp, ticker}
+    "awaiting_watch_input": False,
+    "auto_buy_enabled": True,
+    "watch_list": [],                # [{ticker, level, direction}]
 }
 
 def _execute_order(ig, direction: str, ticker: str, size: float):
@@ -306,6 +341,127 @@ def tg_handle_command(text: str):
         tg_send(f"✅ DEFAULT_SIZE set to {DEFAULT_SIZE}")
         return
 
+    # ── Live price check (cmd 19) ──────────────────────────
+    if _bot_state.get("awaiting_price_check"):
+        _bot_state["awaiting_price_check"] = False
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        threading.Thread(target=_check_price, args=(cmd.upper().strip(),), daemon=True).start()
+        return
+
+    # ── Single ticker Claude analysis (cmd 20) ─────────────
+    if _bot_state.get("awaiting_claude_ticker"):
+        _bot_state["awaiting_claude_ticker"] = False
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        threading.Thread(target=_analyze_single_ticker, args=(cmd.upper().strip(),), daemon=True).start()
+        return
+
+    # ── News for a ticker (cmd 24) ─────────────────────────
+    if _bot_state.get("awaiting_news_ticker"):
+        _bot_state["awaiting_news_ticker"] = False
+        if cmd.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        threading.Thread(target=_get_news, args=(cmd.upper().strip(),), daemon=True).start()
+        return
+
+    # ── Modify SL/TP multi-step (cmd 22) ───────────────────
+    if _bot_state.get("awaiting_modify_sltp") is not None:
+        mod = _bot_state["awaiting_modify_sltp"]
+        if cmd.lower() in ("n", "no", "cancel"):
+            _bot_state["awaiting_modify_sltp"] = None
+            tg_send("Cancelled.")
+            return
+        if mod["step"] == "select":
+            try:
+                idx = int(cmd) - 1
+                if idx < 0 or idx >= len(mod["pos_list"]):
+                    raise ValueError
+            except ValueError:
+                tg_send("Invalid selection. Cancelled.")
+                _bot_state["awaiting_modify_sltp"] = None
+                return
+            epic, (deal_id, entry, tp, sl, sig, ticker) = mod["pos_list"][idx]
+            mod["epic"]   = epic
+            mod["ticker"] = ticker
+            mod["entry"]  = entry
+            mod["sl"]     = sl
+            mod["tp"]     = tp
+            mod["step"]   = "sl"
+            _bot_state["awaiting_modify_sltp"] = mod
+            tg_send(
+                f"Selected {ticker} (entry ${entry:.2f}, SL ${sl:.2f}, TP ${tp:.2f})\n"
+                f"New SL? Type a number, or 'skip' to keep ${sl:.2f}, or n to cancel"
+            )
+            return
+        if mod["step"] == "sl":
+            if cmd.lower() != "skip":
+                try:
+                    mod["sl"] = float(cmd.replace(",", "."))
+                except ValueError:
+                    tg_send("Invalid number. Cancelled.")
+                    _bot_state["awaiting_modify_sltp"] = None
+                    return
+            mod["step"] = "tp"
+            _bot_state["awaiting_modify_sltp"] = mod
+            tg_send(f"New TP? Type a number, or 'skip' to keep ${mod['tp']:.2f}, or n to cancel")
+            return
+        if mod["step"] == "tp":
+            if cmd.lower() != "skip":
+                try:
+                    mod["tp"] = float(cmd.replace(",", "."))
+                except ValueError:
+                    tg_send("Invalid number. Cancelled.")
+                    _bot_state["awaiting_modify_sltp"] = None
+                    return
+            # Apply update
+            pos = _bot_state.get("open_positions", {})
+            if mod["epic"] in pos:
+                deal_id, _entry, _tp, _sl, sig, ticker = pos[mod["epic"]]
+                pos[mod["epic"]] = (deal_id, _entry, mod["tp"], mod["sl"], sig, ticker)
+                tg_send(
+                    f"✅ Updated {mod['ticker']}\n"
+                    f"  SL: ${mod['sl']:.2f}\n"
+                    f"  TP: ${mod['tp']:.2f}"
+                )
+            else:
+                tg_send(f"⚠️ Position for {mod['ticker']} no longer exists.")
+            _bot_state["awaiting_modify_sltp"] = None
+            return
+
+    # ── Watch list input (cmd 28) ──────────────────────────
+    if _bot_state.get("awaiting_watch_input"):
+        _bot_state["awaiting_watch_input"] = False
+        line = cmd.strip()
+        if line.lower() in ("n", "no", "cancel"):
+            tg_send("Cancelled.")
+            return
+        if line.lower() == "clear":
+            _bot_state["watch_list"] = []
+            tg_send("✅ Watch list cleared.")
+            return
+        parts = line.split()
+        if len(parts) < 3 or parts[0].lower() != "add":
+            tg_send("Format: add TICKER LEVEL above|below   (or clear, or n)")
+            return
+        try:
+            ticker = parts[1].upper()
+            level  = float(parts[2])
+            direction = parts[3].lower() if len(parts) >= 4 else "above"
+            if direction not in ("above", "below"):
+                raise ValueError
+        except (ValueError, IndexError):
+            tg_send("Invalid format. Example: add AAPL 200 above")
+            return
+        _bot_state.setdefault("watch_list", []).append({
+            "ticker": ticker, "level": level, "direction": direction,
+        })
+        tg_send(f"✅ Watching {ticker} {direction} ${level:.2f}")
+        return
+
     # ── Direct trade: BUY TSLA / BUY TSLA 2 / SELL MSFT ──
     parts = cmd.upper().split()
     if len(parts) >= 2 and parts[0] in ("BUY", "SELL"):
@@ -495,6 +651,63 @@ def tg_handle_command(text: str):
                     f"entry ${e['entry']:.2f}  TP ${e['tp']:.2f}  SL ${e['sl']:.2f}"
                 )
             tg_send("\n".join(lines))
+
+    elif cmd == "19":
+        _bot_state["awaiting_price_check"] = True
+        tg_send("💲 Price check — which ticker?\nType the symbol (e.g. AAPL) or n to cancel")
+
+    elif cmd == "20":
+        _bot_state["awaiting_claude_ticker"] = True
+        tg_send("🧠 Single-ticker Claude analysis — which ticker?\nType the symbol or n to cancel")
+
+    elif cmd == "21":
+        if not ig:
+            tg_send("⚠️ Bot not connected.")
+            return
+        threading.Thread(target=_refresh_epic_cache, args=(ig,), daemon=True).start()
+
+    elif cmd == "22":
+        pos = _bot_state.get("open_positions", {})
+        if not pos:
+            tg_send("No open positions to modify.")
+            return
+        pos_list = list(pos.items())
+        lines = ["✏️ Modify SL/TP — pick a position:"]
+        for i, (epic, (deal_id, entry, tp, sl, sig, ticker)) in enumerate(pos_list, 1):
+            lines.append(f"  {i}. {ticker}  entry ${entry:.2f}  SL ${sl:.2f}  TP ${tp:.2f}")
+        lines.append("\nReply with a number, or n to cancel")
+        _bot_state["awaiting_modify_sltp"] = {"step": "select", "pos_list": pos_list}
+        tg_send("\n".join(lines))
+
+    elif cmd == "23":
+        threading.Thread(target=_sector_scan, daemon=True).start()
+
+    elif cmd == "24":
+        _bot_state["awaiting_news_ticker"] = True
+        tg_send("📰 News — which ticker?\nType the symbol or n to cancel")
+
+    elif cmd == "25":
+        _bot_state["auto_buy_enabled"] = not _bot_state.get("auto_buy_enabled", True)
+        state_str = "ON" if _bot_state["auto_buy_enabled"] else "OFF"
+        tg_send(f"🤖 Auto-buy is now {state_str}")
+
+    elif cmd == "26":
+        threading.Thread(target=_export_trade_log_csv, daemon=True).start()
+
+    elif cmd == "27":
+        threading.Thread(target=_risk_dashboard, daemon=True).start()
+
+    elif cmd == "28":
+        watches = _bot_state.get("watch_list", [])
+        lines = [f"🔔 Watch list ({len(watches)} active):"]
+        for w in watches:
+            lines.append(f"  {w['ticker']} {w['direction']} ${w['level']:.2f}")
+        lines.append(
+            "\nReply 'add TICKER LEVEL above|below' to add a watch,\n"
+            "'clear' to remove all, or n to cancel"
+        )
+        _bot_state["awaiting_watch_input"] = True
+        tg_send("\n".join(lines))
 
     else:
         tg_send(MENU)
@@ -1326,6 +1539,239 @@ def _run_backtest(ticker):
         tg_send(f"❌ Backtest failed: {e}")
 
 
+def _check_price(ticker):
+    """Cmd 19: quick price + 1d/5d change."""
+    try:
+        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 2:
+            tg_send(f"⚠️ No data for {ticker}.")
+            return
+        last  = float(df["Close"].iloc[-1])
+        prev  = float(df["Close"].iloc[-2])
+        first = float(df["Close"].iloc[0])
+        pct_1d = (last / prev  - 1) * 100
+        pct_5d = (last / first - 1) * 100
+        tg_send(
+            f"💲 {ticker}\n"
+            f"  Price: ${last:.2f}\n"
+            f"  1d: {pct_1d:+.2f}%\n"
+            f"  5d: {pct_5d:+.2f}%"
+        )
+    except Exception as e:
+        tg_send(f"❌ Price check failed: {e}")
+
+
+def _analyze_single_ticker(ticker):
+    """Cmd 20: Ichimoku summary + Claude opinion for a single ticker."""
+    if not _ANTHROPIC_OK or not CLAUDE_API_KEY:
+        tg_send("⚠️ Claude not configured.")
+        return
+    tg_send(f"🧠 Analyzing {ticker}...")
+    try:
+        summary = _ichimoku_summary(ticker)
+        price = get_realtime_price(ticker)
+        price_str = f"${price:.2f}" if price else "n/a"
+        prompt = (
+            f"You are an expert technical analyst using the Ichimoku + Fibonacci strategy.\n\n"
+            f"Ticker: {ticker}\n"
+            f"Current price: {price_str}\n"
+            f"Ichimoku snapshot: {summary}\n\n"
+            f"1. Is there a valid long entry setup right now?\n"
+            f"2. If yes, give entry zone, take-profit, and stop-loss levels.\n"
+            f"3. Confidence (low/medium/high) and one-sentence reasoning.\n\n"
+            f"Be concise. Format for Telegram (max 2000 chars)."
+        )
+        client = _anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        with client.messages.stream(
+            model="claude-opus-4-7",
+            max_tokens=1500,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            msg = stream.get_final_message()
+        reply = "".join(b.text for b in msg.content if b.type == "text")
+        tg_send(f"🧠 {ticker} — Claude says:\n{reply[:3500]}" if reply else "Claude returned no text.")
+    except Exception as e:
+        tg_send(f"❌ Analysis failed: {e}")
+
+
+def _refresh_epic_cache(ig):
+    """Cmd 21: delete epic_cache.json and rebuild from US_UNIVERSE."""
+    tg_send(f"🔄 Refreshing EPIC cache for {len(US_UNIVERSE)} tickers (~30s)...")
+    try:
+        if os.path.exists(EPIC_CACHE_FILE):
+            os.remove(EPIC_CACHE_FILE)
+        mapping = []
+        for t in US_UNIVERSE:
+            epic = get_epic(ig, t)
+            if epic:
+                mapping.append((t, epic))
+            time.sleep(0.5)
+        with open(EPIC_CACHE_FILE, "w") as f:
+            json.dump(mapping, f)
+        tg_send(f"✅ EPIC cache rebuilt: {len(mapping)}/{len(US_UNIVERSE)} resolved.")
+    except Exception as e:
+        tg_send(f"❌ Refresh failed: {e}")
+
+
+SECTOR_ETFS = [
+    ("XLK", "Technology"),
+    ("XLF", "Financials"),
+    ("XLE", "Energy"),
+    ("XLV", "Healthcare"),
+    ("XLY", "Cons. Discretionary"),
+    ("XLP", "Cons. Staples"),
+    ("XLI", "Industrials"),
+    ("XLB", "Materials"),
+    ("XLU", "Utilities"),
+    ("XLRE", "Real Estate"),
+    ("XLC", "Communication"),
+]
+
+
+def _sector_scan():
+    """Cmd 23: today's % change for S&P sector ETFs."""
+    tg_send("🔍 Fetching sector ETFs...")
+    try:
+        results = []
+        for sym, name in SECTOR_ETFS:
+            df = yf.download(sym, period="2d", interval="1d", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df.empty or len(df) < 2:
+                continue
+            prev = float(df["Close"].iloc[-2])
+            last = float(df["Close"].iloc[-1])
+            pct  = (last / prev - 1) * 100
+            results.append((name, sym, pct, last))
+        if not results:
+            tg_send("No sector data available.")
+            return
+        results.sort(key=lambda x: x[2], reverse=True)
+        lines = ["📊 Sector Scan (today):"]
+        for name, sym, pct, last in results:
+            arrow = "🟢" if pct > 0 else "🔴"
+            lines.append(f"  {arrow} {name} ({sym}): {pct:+.2f}% @ ${last:.2f}")
+        tg_send("\n".join(lines))
+    except Exception as e:
+        tg_send(f"❌ Sector scan failed: {e}")
+
+
+def _get_news(ticker):
+    """Cmd 24: recent headlines for a ticker via yfinance."""
+    tg_send(f"📰 Fetching news for {ticker}...")
+    try:
+        items = yf.Ticker(ticker).news or []
+        if not items:
+            tg_send(f"No news for {ticker}.")
+            return
+        lines = [f"📰 {ticker} — recent headlines:"]
+        for item in items[:5]:
+            content = item.get("content", item)
+            title = content.get("title") or item.get("title", "(no title)")
+            pub   = content.get("pubDate") or item.get("providerPublishTime", "")
+            lines.append(f"  • {title}\n    {pub}")
+        tg_send("\n".join(lines))
+    except Exception as e:
+        tg_send(f"❌ News fetch failed: {e}")
+
+
+def _export_trade_log_csv():
+    """Cmd 26: dump trade_log and auto_buy_log to CSV files; send via Telegram."""
+    try:
+        import csv
+        from datetime import datetime as _dt
+        stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        # Trade log
+        trade_path = f"trade_log_{stamp}.csv"
+        with open(trade_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["index", "pnl"])
+            for i, pnl in enumerate(_bot_state.get("trade_log", []), 1):
+                w.writerow([i, pnl])
+        tg_send_document(trade_path, caption=f"Trade log ({len(_bot_state.get('trade_log', []))} trades)")
+
+        # Auto-buy log
+        if _bot_state.get("auto_buy_log"):
+            ab_path = f"auto_buy_log_{stamp}.csv"
+            with open(ab_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["time", "ticker", "entry", "tp", "sl", "deal_ref"])
+                for e in _bot_state["auto_buy_log"]:
+                    w.writerow([e["time"], e["ticker"], e["entry"], e["tp"], e["sl"], e["deal_ref"]])
+            tg_send_document(ab_path, caption=f"Auto-buy log ({len(_bot_state['auto_buy_log'])} entries)")
+    except Exception as e:
+        tg_send(f"❌ CSV export failed: {e}")
+
+
+def _risk_dashboard():
+    """Cmd 27: drawdown, win rate, average win/loss, open exposure."""
+    try:
+        trades = _bot_state.get("trade_log", [])
+        pos    = _bot_state.get("open_positions", {})
+        if trades:
+            n      = len(trades)
+            wins   = [t for t in trades if t > 0]
+            losses = [t for t in trades if t <= 0]
+            wr     = len(wins) / n * 100 if n else 0
+            avg_w  = sum(wins) / len(wins) if wins else 0
+            avg_l  = sum(losses) / len(losses) if losses else 0
+            # Drawdown over cumulative P&L curve
+            cum, peak, max_dd = 0.0, 0.0, 0.0
+            for t in trades:
+                cum += t
+                peak = max(peak, cum)
+                max_dd = min(max_dd, cum - peak)
+        else:
+            n, wr, avg_w, avg_l, max_dd = 0, 0, 0, 0, 0
+        # Open exposure
+        exposure = 0.0
+        for _, (_, entry, *_rest) in pos.items():
+            exposure += entry * DEFAULT_SIZE
+        tg_send(
+            "📊 Risk Dashboard\n"
+            f"Trades closed: {n}\n"
+            f"Win rate: {wr:.1f}%\n"
+            f"Avg win: {avg_w:+.2f}\n"
+            f"Avg loss: {avg_l:+.2f}\n"
+            f"Max drawdown: {max_dd:.2f}\n"
+            f"Open positions: {len(pos)}\n"
+            f"Exposure (est.): ${exposure:.2f}"
+        )
+    except Exception as e:
+        tg_send(f"❌ Risk dashboard failed: {e}")
+
+
+def _watch_list_loop():
+    """Background thread: poll watch_list every 60s and alert on crossings."""
+    while True:
+        try:
+            watches = list(_bot_state.get("watch_list", []))
+            triggered_idx = []
+            for i, w in enumerate(watches):
+                price = get_realtime_price(w["ticker"])
+                if price is None:
+                    continue
+                if (w["direction"] == "above" and price >= w["level"]) or \
+                   (w["direction"] == "below" and price <= w["level"]):
+                    tg_send(
+                        f"🔔 ALERT {w['ticker']} {w['direction']} ${w['level']:.2f}\n"
+                        f"   Now: ${price:.2f}"
+                    )
+                    triggered_idx.append(i)
+            # Remove triggered watches
+            if triggered_idx:
+                wl = _bot_state.get("watch_list", [])
+                for i in reversed(triggered_idx):
+                    if i < len(wl):
+                        wl.pop(i)
+        except Exception as e:
+            logging.error(f"Watch list loop error: {e}")
+        time.sleep(60)
+
+
 def analyze_top_losers():
     """Fetch top losers + gainers + most active, run Ichimoku on each, ask Claude for entry recommendations."""
     if not _ANTHROPIC_OK:
@@ -1476,6 +1922,9 @@ def analyze_top_losers():
     tg_send(f"🧠 Claude Analysis:\n{display_reply[:4000]}")
 
     # ── Auto-buy Claude's top picks ──────────────────────────
+    if not _bot_state.get("auto_buy_enabled", True):
+        tg_send("ℹ️ Auto-buy is OFF — skipping order placement. Use cmd 25 to toggle.")
+        return
     if not top_picks:
         tg_send("ℹ️ No auto-buy: Claude found no qualifying setups.")
         return
@@ -1541,6 +1990,7 @@ def live_trading_all_us_stocks():
     _bot_state["start_time"] = time.time()
 
     threading.Thread(target=tg_listener, daemon=True).start()
+    threading.Thread(target=_watch_list_loop, daemon=True).start()
 
     tg_send("🤖 IG Bot Started (Top 30 US Stocks)")
     tg_send(MENU)
