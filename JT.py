@@ -370,6 +370,7 @@ def tg_handle_command(text: str):
             tg_send("Invalid size. Cancelled.")
             return
         DEFAULT_SIZE = new_size
+        _save_state()
         tg_send(f"✅ DEFAULT_SIZE set to {DEFAULT_SIZE}")
         return
 
@@ -473,6 +474,7 @@ def tg_handle_command(text: str):
             return
         if line.lower() == "clear":
             _bot_state["watch_list"] = []
+            _save_state()
             tg_send("✅ Watch list cleared.")
             return
         parts = line.split()
@@ -491,6 +493,7 @@ def tg_handle_command(text: str):
         _bot_state.setdefault("watch_list", []).append({
             "ticker": ticker, "level": level, "direction": direction,
         })
+        _save_state()
         tg_send(f"✅ Watching {ticker} {direction} ${level:.2f}")
         return
 
@@ -724,6 +727,7 @@ def tg_handle_command(text: str):
     elif cmd == "25":
         _bot_state["auto_buy_enabled"] = not _bot_state.get("auto_buy_enabled", True)
         state_str = "ON" if _bot_state["auto_buy_enabled"] else "OFF"
+        _save_state()
         tg_send(f"🤖 Auto-buy is now {state_str}")
 
     elif cmd == "26":
@@ -1109,6 +1113,53 @@ def load_us_stock_universe():
     return US_UNIVERSE
 
 EPIC_CACHE_FILE = "epic_cache.json"
+STATE_FILE      = "bot_state.json"
+
+
+def _save_state():
+    """Persist trade_log, auto_buy_log, watch_list, DEFAULT_SIZE, auto_buy_enabled."""
+    try:
+        data = {
+            "trade_log":         _bot_state.get("trade_log", []),
+            "auto_buy_log":      _bot_state.get("auto_buy_log", []),
+            "watch_list":        _bot_state.get("watch_list", []),
+            "auto_buy_enabled":  _bot_state.get("auto_buy_enabled", True),
+            "default_size":      DEFAULT_SIZE,
+            "saved_at":          time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, STATE_FILE)  # atomic on Windows + POSIX
+    except Exception as e:
+        logging.error(f"_save_state failed: {e}")
+
+
+def _load_state():
+    """Restore persisted state if bot_state.json exists. Open positions are NOT
+    loaded here — they're synced fresh from the broker after this."""
+    global DEFAULT_SIZE
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        _bot_state["trade_log"]        = list(data.get("trade_log", []))
+        _bot_state["auto_buy_log"]     = list(data.get("auto_buy_log", []))
+        _bot_state["watch_list"]       = list(data.get("watch_list", []))
+        _bot_state["auto_buy_enabled"] = bool(data.get("auto_buy_enabled", True))
+        if data.get("default_size"):
+            DEFAULT_SIZE = float(data["default_size"])
+        saved_at = data.get("saved_at", "?")
+        logging.info(
+            f"State loaded from {saved_at}: "
+            f"{len(_bot_state['trade_log'])} trades, "
+            f"{len(_bot_state['auto_buy_log'])} auto-buys, "
+            f"{len(_bot_state['watch_list'])} watches, "
+            f"DEFAULT_SIZE={DEFAULT_SIZE}, auto_buy={_bot_state['auto_buy_enabled']}"
+        )
+    except Exception as e:
+        logging.error(f"_load_state failed: {e}")
 
 def build_epic_universe(broker):
     # Alpaca: skip EPIC lookup entirely — symbol IS the identifier.
@@ -2322,6 +2373,7 @@ def live_trading_all_us_stocks():
     threading.Thread(target=_watch_list_loop, daemon=True).start()
 
     tg_send(f"🤖 Bot Started — broker: {broker_label} (Top 30 US Stocks)")
+    _load_state()
     _sync_positions_from_broker(ig)
     tg_send(MENU)
 
@@ -2427,6 +2479,7 @@ def live_trading_all_us_stocks():
                     del open_positions[epic]
                     pos_sizes.pop(epic, None)
 
+            _save_state()
             time.sleep(60)
 
         except Exception as e:
