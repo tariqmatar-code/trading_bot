@@ -24,6 +24,15 @@ INDICES = {
     "VIX":          "^VIX",
 }
 
+# Index futures trade overnight, so they give the best read on pre-market direction.
+FUTURES = {
+    "S&P 500 (ES)":  "ES=F",
+    "NASDAQ (NQ)":   "NQ=F",
+    "Dow (YM)":      "YM=F",
+    "Russell (RTY)": "RTY=F",
+    "VIX":           "^VIX",
+}
+
 SECTORS = {
     "Technology":    "XLK",
     "Financials":    "XLF",
@@ -62,29 +71,34 @@ def gather_account_snapshot(client: IGClient) -> dict:
     }
 
 
-def gather_market_data() -> dict:
-    """Fetch latest index prices and sector performance from Yahoo Finance."""
-    def _fetch(ticker: str) -> dict | None:
-        try:
-            hist = yf.Ticker(ticker).history(period="2d", interval="1d", prepost=True)
-            if len(hist) < 2:
-                return None
-            prev  = float(hist["Close"].iloc[-2])
-            last  = float(hist["Close"].iloc[-1])
-            pct   = (last - prev) / prev * 100
-            return {"price": last, "prev": prev, "pct": pct}
-        except Exception:
+def _fetch_quote(ticker: str) -> dict | None:
+    try:
+        hist = yf.Ticker(ticker).history(period="2d", interval="1d", prepost=True)
+        if len(hist) < 2:
             return None
+        prev  = float(hist["Close"].iloc[-2])
+        last  = float(hist["Close"].iloc[-1])
+        pct   = (last - prev) / prev * 100
+        return {"price": last, "prev": prev, "pct": pct}
+    except Exception:
+        return None
 
-    indices = {name: _fetch(sym) for name, sym in INDICES.items()}
-    sectors = {name: _fetch(sym) for name, sym in SECTORS.items()}
+
+def gather_market_data(indices: dict = INDICES) -> dict:
+    """Fetch latest index prices and sector performance from Yahoo Finance.
+
+    Pass ``indices=FUTURES`` for a pre-market read (index futures trade overnight).
+    """
+    idx = {name: _fetch_quote(sym) for name, sym in indices.items()}
+    sec = {name: _fetch_quote(sym) for name, sym in SECTORS.items()}
     return {
-        "indices": {k: v for k, v in indices.items() if v},
-        "sectors": {k: v for k, v in sectors.items() if v},
+        "indices": {k: v for k, v in idx.items() if v},
+        "sectors": {k: v for k, v in sec.items() if v},
     }
 
 
-def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market: dict | None = None) -> None:
+def build_report_pdf(snapshot: dict, report_type: str, output_path: Path,
+                     market: dict | None = None, movers: list[dict] | None = None) -> None:
     doc = SimpleDocTemplate(
         str(output_path), pagesize=letter,
         rightMargin=0.75 * inch, leftMargin=0.75 * inch,
@@ -112,7 +126,11 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market
     ts  = snapshot["timestamp"]
     cur = snapshot["currency"]
 
-    title = "Market Open Report" if report_type == "open" else "Market Close Report"
+    title = {
+        "open":      "Market Open Report",
+        "close":     "Market Close Report",
+        "premarket": "Pre-Market Report",
+    }.get(report_type, "Market Report")
     story.append(Paragraph(f"📊 {title}", title_style))
     story.append(Paragraph(
         f"{ts.strftime('%A, %B %d, %Y')} &nbsp;&nbsp;|&nbsp;&nbsp; Generated at {ts.strftime('%I:%M %p')}",
@@ -153,7 +171,8 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market
         def _color(pct): return colors.HexColor("#276749") if pct >= 0 else colors.HexColor("#c53030")
 
         if market.get("indices"):
-            story.append(Paragraph("Market Overview", section_style))
+            overview_heading = "Index Futures" if report_type == "premarket" else "Market Overview"
+            story.append(Paragraph(overview_heading, section_style))
             idx_data = [["Index", "Price", "Change"]]
             for name, d in market["indices"].items():
                 idx_data.append([name, f"{d['price']:,.2f}", f"{_arrow(d['pct'])} {d['pct']:+.2f}%"])
@@ -197,6 +216,36 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market
                 sec_style.append(("FONTNAME",  (2, i), (2, i), "Helvetica-Bold"))
             sec_table.setStyle(TableStyle(sec_style))
             story.append(sec_table)
+
+    # Top pre-market movers (from the scanner)
+    if movers:
+        story.append(Paragraph("Top Pre-Market Movers", section_style))
+        mov_data = [["Symbol", "Price", "Change", "Bullish", "Volume"]]
+        for m in movers:
+            mov_data.append([
+                m["symbol"],
+                f"{m['last_price']:.2f}",
+                f"▲ +{m['pct_change']:.2f}%",
+                f"{m['pct_green']:.0f}%",
+                f"{m['volume']:,}",
+            ])
+        mov_table = Table(mov_data, colWidths=[1.2 * inch, 1.1 * inch, 1.3 * inch, 1 * inch, 1.4 * inch])
+        mov_style = [
+            ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+            ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+            ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 10),
+            ("ALIGN",         (1, 0), (-1, -1), "RIGHT"),
+            ("GRID",          (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ]
+        for i in range(1, len(mov_data)):
+            mov_style.append(("TEXTCOLOR", (2, i), (2, i), colors.HexColor("#276749")))
+            mov_style.append(("FONTNAME",  (2, i), (2, i), "Helvetica-Bold"))
+        mov_table.setStyle(TableStyle(mov_style))
+        story.append(mov_table)
 
     # Open positions
     story.append(Paragraph("Open Positions", section_style))
@@ -282,7 +331,8 @@ def build_report_pdf(snapshot: dict, report_type: str, output_path: Path, market
     doc.build(story)
 
 
-def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None = None) -> str:
+def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None = None,
+                           movers: list[dict] | None = None) -> str:
     equity = snapshot["equity"]
     cash   = snapshot["cash"]
     pnl    = snapshot["pnl"]
@@ -290,7 +340,11 @@ def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None
     sign   = "+" if pnl >= 0 else ""
     emoji  = "🟢" if pnl >= 0 else "🔴"
 
-    title = "🌅 <b>Market Open Report</b>" if report_type == "open" else "🌆 <b>Market Close Report</b>"
+    title = {
+        "open":      "🌅 <b>Market Open Report</b>",
+        "close":     "🌆 <b>Market Close Report</b>",
+        "premarket": "🌄 <b>Pre-Market Briefing</b>",
+    }.get(report_type, "📊 <b>Market Report</b>")
     ts    = snapshot["timestamp"].strftime("%Y-%m-%d %H:%M")
 
     msg  = f"{title}\n<i>{ts}</i>\n\n"
@@ -298,7 +352,8 @@ def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None
     if market:
         def _e(pct): return "🟢" if pct >= 0 else "🔴"
         if market.get("indices"):
-            msg += "📈 <b>Market Overview</b>\n"
+            overview_heading = "Index Futures" if report_type == "premarket" else "Market Overview"
+            msg += f"📈 <b>{overview_heading}</b>\n"
             for name, d in market["indices"].items():
                 msg += f"  {_e(d['pct'])} <b>{name}:</b> {d['price']:,.2f}  ({d['pct']:+.2f}%)\n"
             msg += "\n"
@@ -308,6 +363,15 @@ def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None
             for name, d in sorted_sec:
                 msg += f"  {_e(d['pct'])} {name}: {d['pct']:+.2f}%\n"
             msg += "\n"
+
+    if movers:
+        msg += f"🚀 <b>Top Pre-Market Movers ({len(movers)})</b>\n"
+        for m in movers:
+            msg += (
+                f"  📈 <b>{m['symbol']}</b>  ${m['last_price']:.2f}  "
+                f"(+{m['pct_change']:.2f}%)  |  {m['pct_green']:.0f}% bullish\n"
+            )
+        msg += "\n"
 
     msg += f"💰 <b>Balance:</b> {cur} {equity:,.2f}\n"
     msg += f"💵 <b>Available:</b> {cur} {cash:,.2f}\n"
@@ -338,7 +402,8 @@ def build_telegram_summary(snapshot: dict, report_type: str, market: dict | None
     return msg
 
 
-def generate_report(report_type: str = "close", client: IGClient = None) -> Path:
+def generate_report(report_type: str = "close", client: IGClient = None,
+                    movers: list[dict] | None = None) -> Path:
     log.info(f"Generating {report_type} report...")
     if client is None:
         client = IGClient()
@@ -347,17 +412,20 @@ def generate_report(report_type: str = "close", client: IGClient = None) -> Path
     snapshot = gather_account_snapshot(client)
 
     market = None
-    if report_type == "open":
+    if report_type == "premarket":
+        log.info("Fetching pre-market index futures from Yahoo Finance...")
+        market = gather_market_data(indices=FUTURES)
+    elif report_type == "open":
         log.info("Fetching market data from Yahoo Finance...")
         market = gather_market_data()
 
     date_str = snapshot["timestamp"].strftime("%Y-%m-%d")
     pdf_path = REPORT_DIR / f"{date_str}_{report_type}_report.pdf"
 
-    build_report_pdf(snapshot, report_type, pdf_path, market=market)
+    build_report_pdf(snapshot, report_type, pdf_path, market=market, movers=movers)
     log.info(f"PDF saved: {pdf_path}")
 
-    send_telegram(build_telegram_summary(snapshot, report_type, market=market))
+    send_telegram(build_telegram_summary(snapshot, report_type, market=market, movers=movers))
     send_telegram_document(pdf_path, caption=f"📄 {report_type.title()} report")
 
     return pdf_path
