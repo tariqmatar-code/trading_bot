@@ -20,6 +20,7 @@ import config
 from utils import log, send_telegram, validate_config, test_telegram_connection
 from scanner import _fetch_all_us
 from claude_analyst import analyse_premarket_signal
+from reports import generate_report
 
 ET = pytz.timezone("America/New_York")
 PREMARKET_START = (4, 0)   # 4:00 AM ET
@@ -27,6 +28,11 @@ PREMARKET_END   = (9, 30)  # 9:30 AM ET
 SCAN_INTERVAL   = 900       # 15 minutes
 TREND_THRESHOLD = 60.0      # % of green candles required
 MIN_CANDLES     = 10        # minimum candles needed to evaluate
+
+# Pre-market briefing report: fired once per morning at/after this ET time,
+# shortly before the open. Uses that scan's signals as the "top movers".
+BRIEFING_TIME   = (9, 0)   # 9:00 AM ET
+BRIEFING_MOVERS = 10       # number of top signals to include in the briefing
 
 
 def is_premarket() -> bool:
@@ -180,20 +186,30 @@ def send_results(signals: list[dict], premarket_data: dict) -> None:
     send_telegram(msg)
 
 
+def send_briefing(signals: list[dict]) -> None:
+    """Send the pre-market opening briefing report (index futures + account + top movers)."""
+    movers = signals[:BRIEFING_MOVERS]
+    log.info(f"Sending pre-market briefing report ({len(movers)} movers)...")
+    generate_report("premarket", movers=movers)
+
+
 def run_premarket_scanner() -> None:
     log.info("Pre-market scanner starting...")
     validate_config()
     if not test_telegram_connection():
         raise SystemExit(1)
 
+    brief_h, brief_m = BRIEFING_TIME
     send_telegram(
         f"🌅 <b>Pre-Market Scanner started</b>\n"
         f"Schedule: every 15 min from 4:00 AM to 9:30 AM ET\n"
         f"Criteria: 60%+ bullish (green) pre-market candles + positive vs prev close\n"
-        f"Universe: ALL US stocks"
+        f"Universe: ALL US stocks\n"
+        f"Briefing report: once daily at ~{brief_h:02d}:{brief_m:02d} ET"
     )
 
-    last_scan_minute = None
+    last_scan_minute   = None
+    last_briefing_date = None
 
     while True:
         try:
@@ -222,6 +238,17 @@ def run_premarket_scanner() -> None:
             signals, premarket_data = scan_premarket()
             send_results(signals, premarket_data)
             log.info(f"Scan complete. {len(signals)} signals sent to Telegram.")
+
+            # Fire the pre-market briefing once per morning, at/after BRIEFING_TIME,
+            # using this scan's freshest signals as the top movers.
+            today = now_et.date()
+            if (now_et.hour, now_et.minute) >= BRIEFING_TIME and last_briefing_date != today:
+                try:
+                    send_briefing(signals)
+                    last_briefing_date = today
+                except Exception as e:
+                    log.error(f"Pre-market briefing failed: {e}")
+                    send_telegram(f"⚠️ Pre-market briefing failed: {e}")
 
             time.sleep(30)
 
